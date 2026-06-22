@@ -13,31 +13,13 @@ class SpatialAutoencoderTrainer:
     
     def __init__(
         self,
-        adata: ad.AnnData,
-        
-        # Neighbor graph kwargs
-        unique_core_key: str = 'core_id',
-        spatial_key: str = 'spatial',
-        neighbor_method: Literal['knn', 'radius', 'precomputed'] = 'knn',
-        precomputed_neighbor_key: str = 'spatial_connectivities',
-        precomputed_distance_key: str = 'spatial_distances',
-        n_neighbors: int = 15,
-        radius: float = 100,
-        knn_max_radius: Optional[float] = None,
-        max_neighbors: int = 20,
+        graph: SpatialNeighbors,
 
-        # Splitting kwargs
-        split_method: Literal['grid', 'core'] = 'grid',
-        bin_length: float = 400,
-        buffer_cells: bool = True,
-        test_size: float = 0.15,
-        val_size: float = 0.15,
-        random_state: int = 42,
-        batch_key: Optional[str] = None,
-        
         # Dataset kwargs:
+        batch_key: Optional[str] = None,
         layer: Optional[str] = None,
-
+        max_neighbors: int = 50,
+        
         # Dataloader kwargs:
         batch_size: int = 2**10,
         num_workers: int = 0,
@@ -47,7 +29,7 @@ class SpatialAutoencoderTrainer:
         hidden_dims: List[int] = [],
         num_heads: int = 1,
         dropout: float = 0.1,
-        batch_dim: int = 4,
+        batch_dim: int = 5,
         rbf_n_basis: int = 8,
         rbf_spacing: Literal['linear', 'log'] = 'linear',
         activation: Literal['gelu', 'relu', 'leaky_relu'] = 'gelu',
@@ -81,27 +63,14 @@ class SpatialAutoencoderTrainer:
         # Other kwargs:
         device: str = 'auto',
         dst_dir: Optional[str] = None,
+        random_state: int = 42
     ):
-        self.adata = adata
-        self.unique_core_key = unique_core_key
-        self.spatial_key = spatial_key
-        self.neighbor_method = neighbor_method
-        self.precomputed_neighbor_key = precomputed_neighbor_key
-        self.precomputed_distance_key = precomputed_distance_key
-        self.n_neighbors = n_neighbors
-        self.radius = radius
-        self.knn_max_radius = knn_max_radius
-        self.max_neighbors = max_neighbors
+        self.graph = graph
         
-        self.split_method = split_method
-        self.bin_length = bin_length
-        self.buffer_cells = buffer_cells
-        self.test_size = test_size
-        self.val_size = val_size
         self.random_state = random_state
         self.batch_key = batch_key
-
         self.layer = layer
+        self.max_neighbors = max_neighbors
 
         self.batch_size = batch_size
         self.num_workers = num_workers
@@ -124,14 +93,14 @@ class SpatialAutoencoderTrainer:
         # Setup batches
         self.n_batches = 1
         self.batch_dim = 0
-        self.labels = np.zeros(len(self.adata), dtype = np.int32)
+        self.labels = np.zeros(len(self.graph.adata), dtype = np.int32)
         if self.batch_key:
-            if self.batch_key not in self.adata.obs:
+            if self.batch_key not in self.graph.adata.obs:
                 raise ValueError(f"Batch key {self.batch_key} not in adata.obs")
-            labels, unique = pd.factorize(self.adata.obs[self.batch_key])
+            labels, unique = pd.factorize(self.graph.adata.obs[self.batch_key])
             self.labels = labels
             self.n_batches = len(unique)
-            self.adata.obs[f'{self.batch_key}_int'] = labels
+            self.graph.adata.obs[f'{self.batch_key}_int'] = labels
         self.learning_rate = learning_rate
         self.weigh_decay = weight_decay
         self.lr_patience = lr_patience
@@ -160,9 +129,7 @@ class SpatialAutoencoderTrainer:
                 Path(dst_dir).mkdir(parents = True, exist_ok = True)
         
         # Initialize setup variables
-        self.graph = None
         self.dataset = None
-        self.split_idx = None
         self.train_loader = None
         self.test_loader = None
         self.val_loader = None
@@ -176,72 +143,30 @@ class SpatialAutoencoderTrainer:
     def setup(self, verbose: bool = True):
         
         if verbose:
-            print("Setting up spatial neighborhood graph")
-        self._setup_spatial_graph()
+            print("Setting up spatial datasets and dataloaders")
         self._setup_dataset()
-        self._setup_splitting()
-        if verbose:
-            print("Setting up dataloaders and model")
         self._setup_dataloaders()
         self._setup_model()
         self._setup_optimizer()
         self._setup_loss()
         if verbose:
             print("--- Done with setup ---")
-            
-    def _setup_spatial_graph(self):
-        self.graph = SpatialNeighbors(
-            self.adata,
-            unique_core_key = self.unique_core_key,
-            spatial_key = self.spatial_key,
-            neighbor_method = self.neighbor_method,
-            precomputed_distance_key = self.precomputed_distance_key,
-            precomputed_neighbor_key = self.precomputed_neighbor_key,
-            n_neighbors = self.n_neighbors,
-            radius = self.radius,
-            knn_max_radius = self.knn_max_radius,
-            max_neighbors = self.max_neighbors
-        )
-        self.graph.build_neighbors()
+
         
     def _setup_dataset(self):
         if self.graph is None:
             self._setup_spatial_graph()
             
-        self.dataset = SpatialDataset.from_graph(self.graph, layer = self.layer, batch_key = f'{self.batch_key}_int' if self.batch_key else None)
-        
-    def _setup_splitting(self, verbose: bool = True):
-        if self.graph is None:
-            self._setup_spatial_graph()
-            
-        if self.split_method == 'grid':
-            self.split_idx = self.graph.split_by_bin(
-                bin_length = self.bin_length,
-                buffer_cells = self.buffer_cells,
-                test_size = self.test_size,
-                val_size = self.val_size,
-                random_state = self.random_state,
-                verbose = True,
-            )
-        elif self.split_method == 'core':
-            self.split_idx = self.graph.split_by_core(
-                val_size = self.val_size,
-                test_size = self.test_size,
-                stratify_by = f'{self.batch_key}_int' if self.n_batches > 1 else None,
-                random_state = self.random_state
-            )
-        else:
-            raise ValueError(f"Split method must be one of ['grid', 'core']. Received {self.split_method}")
-        
-        self.adata = self.graph.get_adata()
+        self.dataset = SpatialDataset.from_graph(
+            self.graph,
+            layer = self.layer,
+            batch_key = f'{self.batch_key}_int' if self.batch_key else None,
+            random_state = self.random_state            
+        )
 
     def _setup_dataloaders(self):
-        if self.graph is None:
-            self._setup_spatial_graph()
         if self.dataset is None:
             self._setup_dataset()
-        if self.split_idx is None:
-            self._setup_splitting()
 
         def make_stratified_sampler(idxs):
             counts = np.bincount(self.labels[idxs])
@@ -256,20 +181,33 @@ class SpatialAutoencoderTrainer:
                 generator = g
             )
 
-        train_graph, train_indices = self.graph.slice_by_index(self.split_idx['train_idx'])
+        train_graph, train_idx = self.graph.slice_by_index(self.graph.split_idx['train_idx'])
         self.train_loader = DataLoader(
-            SpatialDataset.from_graph(train_graph, cell_indices = train_indices, batch_key = f'{self.batch_key}_int' if self.batch_key else None),
-            sampler = make_stratified_sampler(train_indices),
+            SpatialDataset.from_graph(
+                train_graph,
+                cell_indices = train_idx, 
+                batch_key = f'{self.batch_key}_int' if self.batch_key else None,
+                layer = self.layer,
+                max_neighbors = self.max_neighbors,
+                train = True,
+                random_state = self.random_state,
+            ),
+            sampler = make_stratified_sampler(self.graph.split_idx['train_idx']),
             batch_size = self.batch_size,
             num_workers = self.num_workers,
             pin_memory = (self.device.type == 'cuda'),
-            #drop_last = len(self.adata) % self.batch_size > 0.25 * self.batch_size, # Drop last batch if too small
-            #shuffle = True
         )
         
-        test_graph, test_indices = self.graph.slice_by_index(self.split_idx['test_idx'])
+        test_graph, test_idx = self.graph.slice_by_index(self.graph.split_idx['test_idx'])
         self.test_loader = DataLoader(
-            SpatialDataset.from_graph(test_graph, cell_indices = test_indices, batch_key = f'{self.batch_key}_int' if self.batch_key else None),
+            SpatialDataset.from_graph(
+                test_graph,
+                cell_indices = test_idx,
+                batch_key = f'{self.batch_key}_int' if self.batch_key else None,
+                layer = self.layer,
+                train = False,
+                random_state = self.random_state
+            ),
             batch_size = self.batch_size,
             num_workers = self.num_workers,
             pin_memory = (self.device.type == 'cuda'),
@@ -277,9 +215,15 @@ class SpatialAutoencoderTrainer:
             shuffle = False
         )
         
-        val_graph, val_indices = self.graph.slice_by_index(self.split_idx['val_idx'])
+        val_graph, val_idx = self.graph.slice_by_index(self.graph.split_idx['val_idx'])
         self.val_loader = DataLoader(
-            SpatialDataset.from_graph(val_graph, cell_indices = val_indices, batch_key = f'{self.batch_key}_int' if self.batch_key else None),
+            SpatialDataset.from_graph(
+                val_graph,
+                cell_indices = val_idx,
+                batch_key = f'{self.batch_key}_int' if self.batch_key else None,
+                layer = self.layer,
+                random_state = self.random_state
+            ),
             batch_size = self.batch_size,
             num_workers = self.num_workers,
             pin_memory = (self.device.type == 'cuda'),
@@ -300,19 +244,20 @@ class SpatialAutoencoderTrainer:
             self._setup_spatial_graph()
         
         self.model = SpatialAutoEncoder(
-            n_genes = self.adata.shape[1],
+            n_genes = self.graph.adata.shape[1],
             latent_dim = self.latent_dim,
             hidden_dims = self.hidden_dims,
             num_heads = self.num_heads,
             dropout = self.dropout,
             n_batches = self.n_batches,
             batch_dim = self.batch_dim,
-            d_min  = np.min(self.graph.distances[self.graph.distances > 0]),
-            d_max = self.graph.distances.max(axis = None),
+            d_min  = self.graph.adata.obsm[self.graph.distance_key].data.min(),
+            d_max = self.graph.adata.obsm[self.graph.distance_key].data.max(),
             rbf_n_basis = self.rbf_n_basis,
             rbf_spacing = self.rbf_spacing,
             activation = self.activation,
         ).to(self.device)
+        
         
     def _setup_optimizer(self):
         if self.model is None:
@@ -360,7 +305,7 @@ class SpatialAutoencoderTrainer:
                 
                 # Update progress bar description in 20% batch increments
                 if (i % max(1, len(self.train_loader) // 5)) == 0 or (i == len(self.train_loader) - 1):
-                    pbar.set_description(f'Current epoch progress={i+1}/{len(self.train_loader)} (Early stop count = {self.early_stopping.counter})')
+                    pbar.set_description(f'Running training loop: batch = {i+1}/{len(self.train_loader)} (Early stop count = {self.early_stopping.counter})')
                 
                 cell_X = batch['cell_X'].to(self.device)
                 neighbor_X = batch['neighbor_X'].to(self.device)
@@ -412,9 +357,12 @@ class SpatialAutoencoderTrainer:
             val_loss = 0.0
             val_recon = 0.0
             val_kl = 0.0
+            pbar.set_description(f'Running validation loop (Early stop count = {self.early_stopping.counter})')
+
             self.model.eval()
             with torch.no_grad():
                 for batch in self.val_loader:
+                # Update progress bar description in 20% batch increments
                     cell_X = batch['cell_X'].to(self.device)
                     neighbor_X = batch['neighbor_X'].to(self.device)
                     neighbor_mask = batch['neighbor_mask'].to(self.device)
@@ -636,4 +584,4 @@ class SpatialAutoencoderTrainer:
         if self.history is not None:
             self.history.to_csv(f'{dst_dir}/history.csv')
         self.model.save(dst_dir)
-        self.adata.write_h5ad(f'{dst_dir}/adata.h5ad')
+        self.graph.adata.write_h5ad(f'{dst_dir}/adata.h5ad')

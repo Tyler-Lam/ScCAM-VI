@@ -15,10 +15,8 @@ class NeighborsConfig:
     neighbor_method: Literal['knn', 'radius', 'precomputed'] = 'knn'
     precomputed_neighbor_key: str = 'spatial_connectivities'
     precomputed_distance_key: str = 'spatial_distances'
-    n_neighbors: int = 15
     radius: float = 100
-    knn_max_radius: Optional[float] = None
-    max_neighbors: int = 20 
+    max_neighbors: Optional[int] = None
     
 @dataclass
 class ModelConfig:

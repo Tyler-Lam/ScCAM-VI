@@ -53,7 +53,7 @@ def get_hex_bins(
 def flag_buffer_cells(
     bin_labels: np.ndarray,
     global_idx: np.ndarray,
-    neighbors: np.ndarray,
+    neighbors: csr_matrix,
     bin_categories: np.ndarray,
 ):
     """
@@ -76,7 +76,7 @@ def flag_buffer_cells(
     # If neighbors are in different bins, flag as buffer
     for i, b in enumerate(bin_labels):
         # Get neighbor indices
-        neighbor_idxs = neighbors[i]
+        neighbor_idxs = neighbors[i].indices
         neighbor_idxs = neighbor_idxs[neighbor_idxs != -1]
         neighbor_bin_labels = bin_labels[global_to_local[neighbor_idxs]]
         if np.any(neighbor_bin_labels != b) & np.any(bin_categories[np.unique(neighbor_bin_labels)] != bin_categories[b]):
@@ -90,37 +90,28 @@ class SpatialNeighbors:
         adata: ad.AnnData,
         unique_core_key: str = 'core_id',
         spatial_key: str = 'spatial',
-        neighbor_method: Literal['knn', 'radius', 'precomputed'] = 'knn',
-        precomputed_neighbor_key: str = 'spatial_connectivities',
-        precomputed_distance_key: str = 'spatial_distances',
-        n_neighbors: int = 15,
+        neighbor_method: Literal['radius', 'precomputed'] = 'radius',
+        neighbor_key: str = 'spatial_connectivities',
+        distance_key: str = 'spatial_distances',
         radius: float = 100,
-        knn_max_radius: Optional[float] = None,
-        max_neighbors: int = 20,
+        max_neighbors: Optional[int] = None,
     ):
         self.n_cells = len(adata)
         self.adata = adata
         self.unique_core_key = unique_core_key
         self.spatial_key = spatial_key
         self.neighbor_method = neighbor_method
-        self.precomputed_neighbor_key = precomputed_neighbor_key
-        self.precomputed_distance_key = precomputed_distance_key
-        self.n_neighbors = n_neighbors
+        self.neighbor_key = neighbor_key
+        self.distance_key = distance_key
         self.radius = radius
-        self.knn_max_radius = knn_max_radius
         self.max_neighbors = max_neighbors
         self.bin_labels = None
         self.is_buffer = None
-        if self.max_neighbors < self.n_neighbors:
-            warnings.warn("Max neighbors must be >= n_neighbors. Setting max_neighbors = n_neighbors", UserWarning)
-            self.max_neighbors = self.n_neighbors
-        
-        self.neighbors = np.full((self.n_cells, self.max_neighbors), fill_value = -1, dtype = np.int64)
-        self.distances = np.zeros((self.n_cells, self.max_neighbors), dtype = np.float32)
+        self.neighbors = [None] * self.n_cells
+        self.distances = [None] * self.n_cells
         
     def build_neighbors(self):
         if self.neighbor_method == 'precomputed':
-            self._build_neighbors_precomputed()
             return
         
         cores = self.adata.obs[self.unique_core_key].values
@@ -130,55 +121,20 @@ class SpatialNeighbors:
             core_mask = (cores == core)
             core_global_idx = np.where(core_mask)[0]
             core_coords = coords[core_mask]
+            self._build_neighbors_radius(core_coords, core_global_idx)
             
-            if self.neighbor_method == 'knn':
-                self._build_neighbors_knn(core_coords, core_global_idx)
-            elif self.neighbor_method == 'radius':
-                self._build_neighbors_radius(core_coords, core_global_idx)
+        dists = np.concatenate(self.distances)
+        row_ind = np.repeat(
+            np.arange(len(self.neighbors)),
+            [len(x) for x in self.neighbors]
+        )
+        col_ind = np.concatenate(self.neighbors)
+        self.adata.obsm[self.distance_key] = csr_matrix((dists, (row_ind, col_ind)), shape = (self.n_cells, self.n_cells))
+        conn_matrix = self.adata.obsm[self.distance_key].copy()
+        conn_matrix.data[:] = 1
+        conn_matrix = conn_matrix.astype(bool)
+        self.adata.obsm[self.neighbor_key] = conn_matrix
         
-    def _build_neighbors_precomputed(self):
-        if self.precomputed_neighbor_key not in adata.obsp:
-            raise ValueError(f"Key {self.precomputed_neighbor_key} is not in adata.obsp")
-        if self.precomputed_distance_key not in adata.obsp:
-            raise ValueError(f"Key {self.precomputed_distance_key} is not in adata.obsp")
-        
-        conn = self.adata.obsp[self.precomputed_neighbors_key]
-        if isinstance(conn, np.ndarray):
-            conn = csr_matrix(conn)
-        elif issparse(conn) and not isinstance(conn, csr_matrix):
-            conn = conn.tocsr()
-            
-        dists = self.adata.obsp[self.precomputed_distance_key]
-        if isinstance(dists, np.ndarray):
-            dists = csr_matrix(dists)
-        elif issparse(dists) and not isinstance(dists, csr_matrix):
-            dists = dists.tocsr()
-            
-        for i in range(self.n_cells):
-            row = conn.getrow(i)
-            idxs = row.indices
-            n = min(len(idxs), self.max_neighbors)
-            self.neighbors[i, :n] = idxs[:n]
-            
-            dist_row = dists.getrow(i)
-            dist_idxs = row.indices
-            n = min(len(dist_idxs), self.max_neighbors)
-            self.distances[i, :n] = dist_idxs[:n]
-        
-    def _build_neighbors_knn(self, coords, global_idx):
-        k = min(self.n_neighbors + 1, len(coords))
-        nn = NearestNeighbors(n_neighbors = k, algorithm = 'ball_tree')
-        nn.fit(coords)
-        dists, indices = nn.kneighbors(coords)
-
-        for i, (row_dist, row_idx) in enumerate(zip(dists, indices)):
-            mask = (row_idx != i)
-            if self.knn_max_radius is not None:
-                mask = mask & (row_dist <= self.knn_max_radius) 
-            n = sum(mask)
-            self.neighbors[global_idx[i], :n] = global_idx[row_idx[mask]]
-            self.distances[global_idx[i], :n] = row_dist[mask]
-            
     def _build_neighbors_radius(self, coords, global_idx):
         nn = NearestNeighbors(radius = self.radius, algorithm = 'ball_tree')
         nn.fit(coords)
@@ -186,13 +142,12 @@ class SpatialNeighbors:
         
         for i, (row_dist, row_idx) in enumerate(zip(dists, indices)):
             mask = (row_idx != i)
-            n = min(len(row_idx) - 1, self.max_neighbors)
-            self.neighbors[global_idx[i], :n] = global_idx[row_idx[mask]][:n]
-            self.distances[global_idx[i], :n] = row_dist[mask][:n]
+            #n = min(len(row_idx) - 1, self.max_neighbors)
+            self.neighbors[global_idx[i]] = global_idx[row_idx[mask]][:self.max_neighbors]
+            self.distances[global_idx[i]] = row_dist[mask][:self.max_neighbors]
             
     def get_neighbors(self, cell_idx: int):
-        mask = (self.neighbors[cell_idx] != -1)
-        return (self.neighbors[cell_idx][mask], self.distances[cell_idx][mask])
+        return self.adata.obsm[self.distance_key]
     
     def _bin_coords(
         self,
@@ -215,7 +170,52 @@ class SpatialNeighbors:
 
         self.bin_labels = bin_labels
 
-    def split_by_bin(
+    def split_data(
+        self,
+        method: Literal['grid', 'core'] = 'grid',
+        bin_length: float = 200,
+        buffer_cells: bool = True,
+        test_size: float = 0.15,
+        val_size: float = 0.15,
+        stratify_by: Optional[str] = None,
+        random_state: float = 42,
+        verbose: bool = False
+    ):
+        if method == 'grid':
+            split_idx = self.split_by_grid(
+                bin_length = bin_length,
+                buffer_cells = buffer_cells,
+                test_size = test_size,
+                val_size = val_size,
+                random_state = random_state,
+                verbose = verbose
+            )
+            self.adata.obs['bin_labels'] = self.bin_labels
+            self.adata.obs['split_category'] = None
+            self.adata.obs.iloc[self.train_idx, self.adata.obs.columns.get_loc('split_category')] = 'train'
+            self.adata.obs.iloc[self.test_idx, self.adata.obs.columns.get_loc('split_category')] = 'test'
+            self.adata.obs.iloc[self.val_idx, self.adata.obs.columns.get_loc('split_category')] = 'val'
+            if self.is_buffer is not None:
+                self.adata.obs['is_buffer'] = self.is_buffer
+                self.adata.obs.iloc[self.is_buffer, self.adata.obs.columns.get_loc('split_category')] = 'buffer'
+
+        elif method == 'core':
+            split_idx = self.split_by_core(
+                val_size = val_size,
+                test_size = test_size,
+                stratify_by = stratify_by,
+                random_state = random_state
+            )
+            self.adata.obs['split_category'] = None
+            self.adata.obs.iloc[self.train_idx, self.adata.obs.columns.get_loc('split_category')] = 'train'
+            self.adata.obs.iloc[self.test_idx, self.adata.obs.columns.get_loc('split_category')] = 'test'
+            self.adata.obs.iloc[self.val_idx, self.adata.obs.columns.get_loc('split_category')] = 'val'
+        else:
+            raise ValueError(f"Split method must be one of ['bin', 'core']. Received {method}")
+        self.split_idx = split_idx
+        return split_idx
+
+    def split_by_grid(
         self,
         bin_length: float,
         buffer_cells: bool = True,
@@ -250,7 +250,7 @@ class SpatialNeighbors:
                 is_buffer_core = flag_buffer_cells(
                     bin_labels,
                     core_global_idx,
-                    self.neighbors[core_mask],
+                    self.adata.obsm[self.neighbor_key][core_mask],
                     bin_categories
                 )
                 
@@ -315,11 +315,7 @@ class SpatialNeighbors:
         cell_indices: np.ndarray
     ):
         
-        all_indices = set(cell_indices)
-        for i in cell_indices:
-            nn = self.get_neighbors(i)[0]
-            all_indices.update(nn)
-        
+        all_indices = set(self.adata.obsm[self.neighbor_key][cell_indices].indices)
         all_indices = sorted(all_indices)
         global_to_local = np.full(self.n_cells, -1, dtype = np.int64)
         global_to_local[all_indices] = np.arange(len(all_indices))
@@ -331,68 +327,11 @@ class SpatialNeighbors:
         sliced.unique_core_key = self.unique_core_key
         sliced.spatial_key = self.spatial_key
         sliced.neighbor_method = self.neighbor_method
-        sliced.precomputed_neighbor_key = self.precomputed_neighbor_key
-        sliced.precomputed_distance_key = self.precomputed_distance_key
-        sliced.n_neighbors = self.n_neighbors
+        sliced.neighbor_key = self.neighbor_key
+        sliced.distance_key = self.distance_key
         sliced.radius = self.radius
-        sliced.knn_max_radius = self.knn_max_radius
         
         sliced.adata = self.adata[all_indices].copy()
-        sliced.distances = self.distances[all_indices].copy()
-        sliced.neighbors = global_to_local[self.neighbors[all_indices]]
+        sliced.adata.obsm[self.distance_key].indices = global_to_local[sliced.adata.obsm[self.distance_key].indices]
+        sliced.adata.obsm[self.neighbor_key].indices = global_to_local[sliced.adata.obsm[self.neighbor_key].indices]
         return sliced, global_to_local[cell_indices]
-    
-    def get_adata(self):
-        cfg = NeighborsConfig(
-            unique_core_key = self.unique_core_key,
-            spatial_key = self.spatial_key,
-            neighbor_method = self.neighbor_method,
-            precomputed_distance_key = self.precomputed_distance_key,
-            precomputed_neighbor_key = self.precomputed_neighbor_key,
-            n_neighbors = self.n_neighbors,
-            radius = self.radius,
-            knn_max_radius = self.knn_max_radius,
-            max_neighbors = self.max_neighbors
-        )
-        
-        self.adata.uns['spatial_neighbors'] = asdict(cfg)
-        #cfgtojson(cfg, f'{dst_dir}/cfg_{savenm}.json')
-        
-        rows, cols, dists, conn = [], [], [], []
-        
-        for cell_idx in range(self.n_cells):
-            neighbors = self.neighbors[cell_idx]
-            distances = self.distances[cell_idx]
-            
-            mask = (neighbors != -1)
-            
-            for neighbor_idx, dist in zip(neighbors[mask], distances[mask]):
-                rows.append(cell_idx)
-                cols.append(neighbor_idx)
-                dists.append(dist)
-                conn.append(1.0)
-        
-        dist_matrix = csr_matrix(
-            (dists, (rows, cols)), shape = (self.n_cells, self.n_cells)
-        )
-        
-        conn_matrix = csr_matrix(
-            (conn, (rows, cols)), shape = (self.n_cells, self.n_cells)
-        )
-        
-        self.adata.obsp['distances'] = dist_matrix
-        self.adata.obsp['connectivities'] = conn_matrix
-        self.adata.uns['neighbors'] = asdict(cfg)
-        if self.bin_labels is not None:
-            self.adata.obs['bin_labels'] = self.bin_labels
-        if self.is_buffer is not None:
-            self.adata.obs['is_buffer'] = self.is_buffer
-            
-        self.adata.obs['split_category'] = None
-        self.adata.obs.iloc[self.train_idx, self.adata.obs.columns.get_loc('split_category')] = 'train'
-        self.adata.obs.iloc[self.test_idx, self.adata.obs.columns.get_loc('split_category')] = 'test'
-        self.adata.obs.iloc[self.val_idx, self.adata.obs.columns.get_loc('split_category')] = 'val'
-        if self.is_buffer is not None:
-            self.adata.obs.iloc[self.is_buffer, self.adata.obs.columns.get_loc('split_category')] = 'buffer'
-
-        return self.adata
