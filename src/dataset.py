@@ -54,7 +54,7 @@ class SpatialDataset(Dataset):
         X = graph.adata.X if layer is None else graph.adata.layers[layer]
         return SpatialDataset(
             X = X,
-            distances = graph.adata.obsm[graph.distance_key],
+            distances = graph.adata.obsp[graph.distance_key],
             max_neighbors = max_neighbors,
             cell_indices = cell_indices,
             batch_labels = graph.adata.obs[batch_key].values if batch_key is not None else None,
@@ -74,8 +74,10 @@ class SpatialDataset(Dataset):
         batch_label = self.batch_labels[cell_idx]
         
         # Get all neighbor indices/distances
-        neighbor_idxs_all = self.distances[cell_idx].indices
-        neighbor_dists_all = self.distances[cell_idx].data
+        start = self.distances.indptr[idx]
+        end = self.distances.indptr[idx + 1]
+        neighbor_idxs_all = self.distances.indices[start:end]
+        neighbor_dists_all = self.distances.data[start:end]
         n_neighbors = len(neighbor_idxs_all)
         neighbor_dists = np.zeros(self.max_neighbors, dtype = np.float32)
         neighbor_mask = torch.zeros(self.max_neighbors, dtype = torch.bool)

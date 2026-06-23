@@ -51,8 +51,8 @@ class SpatialAutoencoderTrainer:
         loss_fn: Literal['mse', 'huber', 'zinb'] = 'zinb',
         delta: float = 1.0,
         max_beta_kl: float = 5,
-        beta_ramp_start: int = 10,
-        beta_ramp_end: int = 30,
+        beta_ramp_start: int = 25,
+        beta_ramp_end: int = 50,
         alpha_ramp_start: int = 50,
         alpha_ramp_end: int = 100,
         
@@ -140,6 +140,10 @@ class SpatialAutoencoderTrainer:
         self.loss = None
         self.embedding = None
         
+    @property
+    def adata(self):
+        return self.graph.adata
+
     def setup(self, verbose: bool = True):
         
         if verbose:
@@ -244,15 +248,15 @@ class SpatialAutoencoderTrainer:
             self._setup_spatial_graph()
         
         self.model = SpatialAutoEncoder(
-            n_genes = self.graph.adata.shape[1],
+            n_genes = self.adata.shape[1],
             latent_dim = self.latent_dim,
             hidden_dims = self.hidden_dims,
             num_heads = self.num_heads,
             dropout = self.dropout,
             n_batches = self.n_batches,
             batch_dim = self.batch_dim,
-            d_min  = self.graph.adata.obsm[self.graph.distance_key].data.min(),
-            d_max = self.graph.adata.obsm[self.graph.distance_key].data.max(),
+            d_min  = self.adata.obsp[self.graph.distance_key].data.min(),
+            d_max = self.adata.obsp[self.graph.distance_key].data.max(),
             rbf_n_basis = self.rbf_n_basis,
             rbf_spacing = self.rbf_spacing,
             activation = self.activation,
@@ -584,4 +588,4 @@ class SpatialAutoencoderTrainer:
         if self.history is not None:
             self.history.to_csv(f'{dst_dir}/history.csv')
         self.model.save(dst_dir)
-        self.graph.adata.write_h5ad(f'{dst_dir}/adata.h5ad')
+        self.adata.write_h5ad(f'{dst_dir}/adata.h5ad')

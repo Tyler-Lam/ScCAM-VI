@@ -129,11 +129,11 @@ class SpatialNeighbors:
             [len(x) for x in self.neighbors]
         )
         col_ind = np.concatenate(self.neighbors)
-        self.adata.obsm[self.distance_key] = csr_matrix((dists, (row_ind, col_ind)), shape = (self.n_cells, self.n_cells))
-        conn_matrix = self.adata.obsm[self.distance_key].copy()
+        self.adata.obsp[self.distance_key] = csr_matrix((dists, (row_ind, col_ind)), shape = (self.n_cells, self.n_cells))
+        conn_matrix = self.adata.obsp[self.distance_key].copy()
         conn_matrix.data[:] = 1
         conn_matrix = conn_matrix.astype(bool)
-        self.adata.obsm[self.neighbor_key] = conn_matrix
+        self.adata.obsp[self.neighbor_key] = conn_matrix
         
     def _build_neighbors_radius(self, coords, global_idx):
         nn = NearestNeighbors(radius = self.radius, algorithm = 'ball_tree')
@@ -147,7 +147,9 @@ class SpatialNeighbors:
             self.distances[global_idx[i]] = row_dist[mask][:self.max_neighbors]
             
     def get_neighbors(self, cell_idx: int):
-        return self.adata.obsm[self.distance_key]
+        start = self.adata.obs[self.neighbor_key].indptr[idx]
+        end = self.adata.obs[self.neighbor_key].indptr[idx + 1]
+        return self.adata.obsp[self.neighbor_key].indices[start:end]
     
     def _bin_coords(
         self,
@@ -250,7 +252,7 @@ class SpatialNeighbors:
                 is_buffer_core = flag_buffer_cells(
                     bin_labels,
                     core_global_idx,
-                    self.adata.obsm[self.neighbor_key][core_mask],
+                    self.adata.obsp[self.neighbor_key][core_mask],
                     bin_categories
                 )
                 
@@ -315,7 +317,7 @@ class SpatialNeighbors:
         cell_indices: np.ndarray
     ):
         
-        all_indices = set(self.adata.obsm[self.neighbor_key][cell_indices].indices)
+        all_indices = set(self.adata.obsp[self.neighbor_key][cell_indices].indices)
         all_indices = sorted(all_indices)
         global_to_local = np.full(self.n_cells, -1, dtype = np.int64)
         global_to_local[all_indices] = np.arange(len(all_indices))
@@ -332,6 +334,6 @@ class SpatialNeighbors:
         sliced.radius = self.radius
         
         sliced.adata = self.adata[all_indices].copy()
-        sliced.adata.obsm[self.distance_key].indices = global_to_local[sliced.adata.obsm[self.distance_key].indices]
-        sliced.adata.obsm[self.neighbor_key].indices = global_to_local[sliced.adata.obsm[self.neighbor_key].indices]
+        sliced.adata.obsp[self.distance_key].indices = global_to_local[sliced.adata.obsp[self.distance_key].indices]
+        sliced.adata.obsp[self.neighbor_key].indices = global_to_local[sliced.adata.obsp[self.neighbor_key].indices]
         return sliced, global_to_local[cell_indices]
