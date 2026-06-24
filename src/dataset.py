@@ -14,11 +14,8 @@ class SpatialDataset(Dataset):
         self,
         X: csr_matrix | np.ndarray,
         distances: csr_matrix,
-        max_neighbors: int = 50,
         cell_indices: Optional[np.ndarray] = None, # Only get cell indicies from this array
         batch_labels: Optional[np.ndarray] = None,
-        random_state: int = 42,
-        train: bool = False
     ):
         super().__init__()
         self.distances = distances
@@ -36,9 +33,7 @@ class SpatialDataset(Dataset):
         if batch_labels is None:
             self.batch_labels = np.zeros(self.X.shape[0], dtype = np.int32)
         self.log_library_size = np.log(np.maximum(self.X.sum(axis = 1), 1))
-        self.train = train
-        self.max_neighbors = max_neighbors if self.train else np.diff(distances.indptr).max()
-        self.rng = np.random.default_rng(seed = random_state)
+        self.max_neighbors = np.diff(distances.indptr).max()
 
     @classmethod
     def from_graph(
@@ -47,19 +42,13 @@ class SpatialDataset(Dataset):
         layer: Optional[str] = None,
         cell_indices: Optional[np.ndarray] = None,
         batch_key: Optional[str] = None,
-        max_neighbors: int = 50,
-        random_state: int = 42,
-        train: bool = False
     ):
         X = graph.adata.X if layer is None else graph.adata.layers[layer]
         return SpatialDataset(
             X = X,
             distances = graph.adata.obsp[graph.distance_key],
-            max_neighbors = max_neighbors,
             cell_indices = cell_indices,
             batch_labels = graph.adata.obs[batch_key].values if batch_key is not None else None,
-            train = train,
-            random_state = random_state
         )
     
     def __len__(self):
@@ -74,35 +63,68 @@ class SpatialDataset(Dataset):
         batch_label = self.batch_labels[cell_idx]
         
         # Get all neighbor indices/distances
-        start = self.distances.indptr[idx]
-        end = self.distances.indptr[idx + 1]
+        start = self.distances.indptr[cell_idx]
+        end = self.distances.indptr[cell_idx + 1]
         neighbor_idxs_all = self.distances.indices[start:end]
         neighbor_dists_all = self.distances.data[start:end]
         n_neighbors = len(neighbor_idxs_all)
         neighbor_dists = np.zeros(self.max_neighbors, dtype = np.float32)
         neighbor_mask = torch.zeros(self.max_neighbors, dtype = torch.bool)
         neighbor_X = np.zeros((self.max_neighbors, self.n_genes), dtype = np.float32)
-        if n_neighbors > self.max_neighbors:
-            weights = 1 / (neighbor_dists_all + 1)
-            weights /= weights.sum()
-            chosen = self.rng.choice(np.arange(n_neighbors), size = self.max_neighbors, p = weights)
-            
-            neighbor_dists = neighbor_dists_all[chosen]
-            neighbor_mask[:] = True
-            neighbor_X = self.X[neighbor_idxs_all[chosen]]
-        else:
-            neighbor_dists[:n_neighbors] = neighbor_dists_all
-            neighbor_mask[:n_neighbors] = True
-            neighbor_X[:n_neighbors] = self.X[neighbor_idxs_all]
-            
-        log_lib_size = torch.tensor(self.log_library_size[cell_idx], dtype = torch.float32)
+
+        neighbor_dists[:n_neighbors] = neighbor_dists_all
+        neighbor_mask[:n_neighbors] = True
+        neighbor_X[:n_neighbors] = self.X[neighbor_idxs_all]
+        
+        log_lib_size = self.log_library_size[cell_idx]
         
         return {
             'cell_idx': cell_idx,
             'cell_X': cell_X,
             'neighbor_X': torch.from_numpy(neighbor_X),
             'neighbor_mask': neighbor_mask,
-            'distances': torch.from_numpy(neighbor_dists).to(torch.float32),
+            'distances': torch.from_numpy(neighbor_dists),
             'log_library_size': log_lib_size,
             'batch_label': batch_label
+        }
+
+    def __getitems__(self, idxs):
+        
+        cell_idx = self.cell_indices[idxs]
+        cell_X = self.X[cell_idx]
+        batch_label = self.batch_labels[cell_idx]
+        
+        starts = self.distances.indptr[cell_idx]
+        ends = self.distances.indptr[cell_idx + 1]
+        max_neighbors = (ends - starts).max()
+        #max_neighbors = np.diff(self.distances[cell_idx].indptr).max()
+
+        neighbor_dists = np.zeros((len(idxs), max_neighbors), dtype = np.float32)
+        neighbor_mask = np.zeros((len(idxs), max_neighbors), dtype = bool)
+        neighbor_X = np.zeros((len(idxs), max_neighbors, self.n_genes), dtype = np.float32)
+        
+        for b, idx in enumerate(cell_idx):
+            start = self.distances.indptr[idx]
+            end = self.distances.indptr[idx + 1]
+            neighbor_idxs_all = self.distances.indices[start:end]
+            neighbor_dists_all = self.distances.data[start:end]
+            
+            n_neighbors = len(neighbor_idxs_all)
+            if n_neighbors == 0:
+                continue
+            
+            neighbor_dists[b, :n_neighbors] = neighbor_dists_all
+            neighbor_mask[b, :n_neighbors] = True
+            neighbor_X[b, :n_neighbors] = self.X[neighbor_idxs_all]
+        
+        log_lib_size = self.log_library_size[cell_idx]
+        
+        return {
+            'cell_idx': torch.from_numpy(cell_idx),
+            'cell_X': torch.from_numpy(cell_X),
+            'neighbor_X': torch.from_numpy(neighbor_X),
+            'neighbor_mask': torch.from_numpy(neighbor_mask),
+            'distances': torch.from_numpy(neighbor_dists),
+            'log_library_size': torch.from_numpy(log_lib_size),
+            'batch_label': torch.from_numpy(batch_label)
         }

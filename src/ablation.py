@@ -5,6 +5,7 @@ import warnings
 from itertools import combinations
 from scipy.special import factorial
 from torch.cuda.amp import autocast
+from tqdm import tqdm
 
 class SpatialAblation:
     def __init__(
@@ -12,14 +13,32 @@ class SpatialAblation:
         trainer: SpatialAutoencoderTrainer,
         batch_size: Optional[int] = None
     ):
+        
         self.model = trainer.model
-        self.device = trainer.device
-        self.max_neighbors = trainer.max_neighbors
         self.adata = trainer.adata
-        self.batch_size = batch_size if batch_size is not None else len(trainer.adata)
+        self.device = trainer.device
+        self.batch_size = batch_size if batch_size is not None else len(self.adata)
         self.model.eval()
         self.embedding = trainer.get_embedding() if trainer.embedding is None else trainer.embedding
         self.mean_z = torch.from_numpy(self.embedding['pre_attention'].mean(axis = 0))
+        
+        # Make dataset object starting from latent embedding
+        self.dataset = SpatialDataset(
+            X = self.embedding['pre_attention'],
+            distances = trainer.adata.obsp[self.trainer.graph.distance_key],
+            batch_labels = None if trainer.batch_key is None else trainer.adata.obs[trainer.batch_key].values,
+        )
+        self.dataset.log_library_size = trainer.dataset.log_library_size
+        
+        self.dataloader = DataLoader(
+            self.dataset,
+            batch_size = self.batch_size,
+            num_workers = 0,
+            pin_memory = (self.device == 'cuda'),
+            shuffle = False,
+            collate_fn = lambda x: x,
+            persistent_workers = True,
+        )
         
         self.X = torch.from_numpy(self.embedding['pre_attention'])
         self.neighbors = trainer.graph.neighbors
@@ -31,6 +50,29 @@ class SpatialAblation:
         self.batch_labels = torch.from_numpy(trainer.dataset.batch_labels)#.to(self.device)
         self.log_library_size = torch.from_numpy(trainer.dataset.log_library_size)#.to(self.device)
 
+    @torch.no_grad()
+    def _run_with_mask(
+        self,
+        ablation_mask: np.ndarray,
+        method: Literal['mask', 'mean', 'zero'] = 'mean',
+        show_progress: bool = False
+    ):
+        self.model.eval()
+        
+        x_hat = []
+        for batch in tqdm(self.dataloader, desc = "Running forward pass with mask", show_progress = show_progress):
+            cell_Z = batch['cell_X'].to(self.device)
+            neighbor_Z = batch['neighbor_X'].to(self.device)
+            neighbor_mask = batch['neighbor_mask'].to(self.device)
+            distances = batch['distances'].to(self.device)
+            log_library_size = batch['log_library_size'].to(self.device)
+            batch_label = batch['batch_label'].to(self.device)
+            
+            post_attn_z = cell_Z.clone()
+            
+            if method == 'mean':
+                neighbor_Z[ablation_mask] = self.mean_z.to
+    
     
     @torch.no_grad()
     def _run_ablation_per_cell(

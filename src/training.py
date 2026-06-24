@@ -18,7 +18,6 @@ class SpatialAutoencoderTrainer:
         # Dataset kwargs:
         batch_key: Optional[str] = None,
         layer: Optional[str] = None,
-        max_neighbors: int = 50,
         
         # Dataloader kwargs:
         batch_size: int = 2**10,
@@ -50,11 +49,18 @@ class SpatialAutoencoderTrainer:
         # Loss kwargs
         loss_fn: Literal['mse', 'huber', 'zinb'] = 'zinb',
         delta: float = 1.0,
-        max_beta_kl: float = 5,
+        beta_kl_max: float = 5,
         beta_ramp_start: int = 25,
         beta_ramp_end: int = 50,
+        # Post attention embedding = gamma * attention_context + alpha * pre_attention_embedding
+        # Anneal alpha to get spatial context first
+        # Anneal gamma to train without spatial context first
         alpha_ramp_start: int = 50,
         alpha_ramp_end: int = 100,
+        alpha_max: float = 1,
+        gamma_ramp_start: int = 0,
+        gamma_ramp_end: int = 0,
+        gamma_max: float = 1,
         
         # Training kwargs
         max_epochs: int = 1000,
@@ -70,7 +76,6 @@ class SpatialAutoencoderTrainer:
         self.random_state = random_state
         self.batch_key = batch_key
         self.layer = layer
-        self.max_neighbors = max_neighbors
 
         self.batch_size = batch_size
         self.num_workers = num_workers
@@ -114,11 +119,15 @@ class SpatialAutoencoderTrainer:
         
         self.loss_fn = loss_fn
         self.delta = delta
-        self.max_beta_kl = max_beta_kl
+        self.beta_kl_max = beta_kl_max
         self.beta_ramp_start = beta_ramp_start
         self.beta_ramp_end = beta_ramp_end
+        self.alpha_max = alpha_max
         self.alpha_ramp_start = alpha_ramp_start
         self.alpha_ramp_end = alpha_ramp_end
+        self.gamma_max = gamma_max
+        self.gamma_ramp_start = gamma_ramp_start
+        self.gamma_ramp_end = gamma_ramp_end
         
         self.max_epochs = max_epochs
         self.grad_clip_norm = grad_clip_norm
@@ -143,9 +152,13 @@ class SpatialAutoencoderTrainer:
     @property
     def adata(self):
         return self.graph.adata
+    
+    @adata.setter
+    def adata(self, value):
+        self.graph.adata = value
 
     def setup(self, verbose: bool = True):
-        
+
         if verbose:
             print("Setting up spatial datasets and dataloaders")
         self._setup_dataset()
@@ -165,7 +178,6 @@ class SpatialAutoencoderTrainer:
             self.graph,
             layer = self.layer,
             batch_key = f'{self.batch_key}_int' if self.batch_key else None,
-            random_state = self.random_state            
         )
 
     def _setup_dataloaders(self):
@@ -192,14 +204,14 @@ class SpatialAutoencoderTrainer:
                 cell_indices = train_idx, 
                 batch_key = f'{self.batch_key}_int' if self.batch_key else None,
                 layer = self.layer,
-                max_neighbors = self.max_neighbors,
-                train = True,
-                random_state = self.random_state,
             ),
+            
             sampler = make_stratified_sampler(self.graph.split_idx['train_idx']),
             batch_size = self.batch_size,
             num_workers = self.num_workers,
             pin_memory = (self.device.type == 'cuda'),
+            collate_fn = lambda x: x,
+            persistent_workers = (self.num_workers > 0),
         )
         
         test_graph, test_idx = self.graph.slice_by_index(self.graph.split_idx['test_idx'])
@@ -209,14 +221,14 @@ class SpatialAutoencoderTrainer:
                 cell_indices = test_idx,
                 batch_key = f'{self.batch_key}_int' if self.batch_key else None,
                 layer = self.layer,
-                train = False,
-                random_state = self.random_state
             ),
             batch_size = self.batch_size,
             num_workers = self.num_workers,
             pin_memory = (self.device.type == 'cuda'),
             drop_last = False,
-            shuffle = False
+            shuffle = False,
+            collate_fn = lambda x: x,
+            persistent_workers = (self.num_workers > 0),
         )
         
         val_graph, val_idx = self.graph.slice_by_index(self.graph.split_idx['val_idx'])
@@ -226,13 +238,14 @@ class SpatialAutoencoderTrainer:
                 cell_indices = val_idx,
                 batch_key = f'{self.batch_key}_int' if self.batch_key else None,
                 layer = self.layer,
-                random_state = self.random_state
             ),
             batch_size = self.batch_size,
             num_workers = self.num_workers,
             pin_memory = (self.device.type == 'cuda'),
             drop_last = False,
-            shuffle = False
+            shuffle = False,
+            collate_fn = lambda x: x,
+            persistent_workers = (self.num_workers > 0),
         )
         
         self.dataloader = DataLoader(
@@ -240,7 +253,9 @@ class SpatialAutoencoderTrainer:
             batch_size = self.batch_size,
             num_workers = self.num_workers,
             pin_memory = (self.device.type == 'cuda'),
-            shuffle = False
+            shuffle = False,
+            collate_fn = lambda x: x,
+            persistent_workers = (self.num_workers > 0),
         )
         
     def _setup_model(self):
@@ -302,11 +317,11 @@ class SpatialAutoencoderTrainer:
             train_loss = 0.0    
             train_recon = 0.0
             train_kl = 0.0   
-            beta_kl = get_anneal_ramp_param(epoch, self.beta_ramp_start, self.beta_ramp_end, self.max_beta_kl, method = 'cosine')
-            alpha = get_anneal_ramp_param(epoch, self.alpha_ramp_start, self.alpha_ramp_end, 1, method = 'cosine')
+            beta_kl = get_anneal_ramp_param(epoch, self.beta_ramp_start, self.beta_ramp_end, self.beta_kl_max, method = 'cosine')
+            alpha = get_anneal_ramp_param(epoch, self.alpha_ramp_start, self.alpha_ramp_end, self.alpha_max, method = 'cosine')
+            gamma = get_anneal_ramp_param(epoch, self.gamma_ramp_start, self.gamma_ramp_end, self.gamma_max, method = 'cosine')
             self.model.train()
             for i, batch in enumerate(self.train_loader):
-                
                 # Update progress bar description in 20% batch increments
                 if (i % max(1, len(self.train_loader) // 5)) == 0 or (i == len(self.train_loader) - 1):
                     pbar.set_description(f'Running training loop: batch = {i+1}/{len(self.train_loader)} (Early stop count = {self.early_stopping.counter})')
@@ -317,6 +332,7 @@ class SpatialAutoencoderTrainer:
                 distances = batch['distances'].to(self.device)
                 log_library_size = batch['log_library_size'].to(self.device)
                 batch_label = batch['batch_label'].to(self.device)
+                
                 self.optimizer.zero_grad()
                 
                 outputs = self.model(
@@ -326,7 +342,8 @@ class SpatialAutoencoderTrainer:
                     distances = distances,
                     log_library_size = log_library_size,
                     batch_label = batch_label,
-                    alpha = alpha
+                    alpha = alpha,
+                    gamma = gamma,
                 )
                 
                 loss, recon_loss, kl_loss = self.loss(
@@ -345,13 +362,12 @@ class SpatialAutoencoderTrainer:
                     max_norm = self.grad_clip_norm
                 )
                 self.optimizer.step()
-                
                 n = len(cell_X)
                 n_train += n
                 train_loss += n * loss.item()
                 train_recon += n * recon_loss
                 train_kl += n * kl_loss
-            
+                
             train_loss /= n_train
             train_recon /= n_train
             train_kl /= n_train
@@ -380,7 +396,8 @@ class SpatialAutoencoderTrainer:
                         distances = distances,
                         log_library_size = log_library_size,
                         batch_label = batch_label,
-                        alpha = alpha
+                        alpha = alpha,
+                        gamma = gamma,
                     )
                     
                     loss, recon_loss, kl_loss = self.loss(
@@ -419,7 +436,8 @@ class SpatialAutoencoderTrainer:
                 'learning_rate': self.optimizer.param_groups[0]['lr'],
                 'early_stopping': self.early_stopping.counter,
                 'beta_kl': beta_kl,
-                'alpha': alpha
+                'alpha': alpha,
+                'gamma': gamma
             })
             if self.early_stopping.early_stop:
                 if verbose:
@@ -443,6 +461,8 @@ class SpatialAutoencoderTrainer:
         lr = self.history['learning_rate'].values
         beta_kl = self.history['beta_kl'].values
         alpha = self.history['alpha'].values
+        gamma = self.history['gamma'].values
+        
         fig, ax = plt.subplots(2, 1, figsize = (6, 5), height_ratios = [3, 1])
         
         ax[0].plot(epochs, train_l, 'k-', label = 'Train loss')
@@ -462,6 +482,7 @@ class SpatialAutoencoderTrainer:
         ax1_1 = ax[1].twinx()
         ax1_1.plot(epochs, (beta_kl) / (beta_kl.max() if beta_kl.max() > 0 else 1), 'C2-', alpha = 0.7, label = r'$\beta_\text{KL}$' + f' [max = {beta_kl.max():.3f}]')
         ax1_1.plot(epochs, (alpha) / (alpha.max() if alpha.max() > 0 else 1), 'm-', alpha = 0.7, label = r'$\alpha$' + f' [max = {alpha.max():.3f}]')
+        ax1_1.plot(epochs, (gamma) / (gamma.max() if gamma.max() > 0 else 1), 'C3-', alpha = 0.7, label = r'$\gamma$' + f' [max = {gamma.max():.3f}]')
         ax1_1.set_ylabel("Other params [a.u.]")
         ax[1].grid()
         lines, labels = ax[1].get_legend_handles_labels()

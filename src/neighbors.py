@@ -76,7 +76,9 @@ def flag_buffer_cells(
     # If neighbors are in different bins, flag as buffer
     for i, b in enumerate(bin_labels):
         # Get neighbor indices
-        neighbor_idxs = neighbors[i].indices
+        start = neighbors.indptr[i]
+        end = neighbors.indptr[i + 1]
+        neighbor_idxs = neighbors.indices[start:end]
         neighbor_idxs = neighbor_idxs[neighbor_idxs != -1]
         neighbor_bin_labels = bin_labels[global_to_local[neighbor_idxs]]
         if np.any(neighbor_bin_labels != b) & np.any(bin_categories[np.unique(neighbor_bin_labels)] != bin_categories[b]):

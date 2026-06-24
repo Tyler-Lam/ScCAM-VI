@@ -90,7 +90,8 @@ class SpatialAutoEncoder(nn.Module):
         neighbor_X: torch.Tensor,
         neighbor_mask: torch.Tensor,
         distances: torch.Tensor,
-        alpha: float = 1.0
+        alpha: float = 1.0,
+        gamma: float = 1.0
     ):
 
         mu, log_var = self.encoder(central_X)
@@ -115,7 +116,7 @@ class SpatialAutoEncoder(nn.Module):
             )
             
             post_attn_z[has_neighbors] *= alpha
-            post_attn_z[has_neighbors] += context
+            post_attn_z[has_neighbors] += gamma * context
         return mu, log_var, pre_attn_z, post_attn_z
     
     def decode(self,post_attn_z: torch.Tensor, log_library_size: torch.Tensor, batch_labels: Optional[torch.Tensor] = None):
@@ -129,14 +130,16 @@ class SpatialAutoEncoder(nn.Module):
         distances: torch.Tensor,
         log_library_size: torch.Tensor,
         batch_label: torch.Tensor,
-        alpha: float = 1.0
+        alpha: float = 1.0,
+        gamma: float = 1.0,
     ):
         mu_z, log_var, pre_attn_z, post_attn_z = self.encode(
             central_X = central_X,
             neighbor_X = neighbor_X,
             neighbor_mask = neighbor_mask,
             distances = distances,
-            alpha = alpha
+            alpha = alpha,
+            gamma = gamma,
         )
         
         mu_x, theta, pi = self.decode(post_attn_z, log_library_size, batch_label)
