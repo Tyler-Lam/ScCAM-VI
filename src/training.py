@@ -55,16 +55,17 @@ class SpatialAutoencoderTrainer:
         # Post attention embedding = gamma * attention_context + alpha * pre_attention_embedding
         # Anneal alpha to get spatial context first
         # Anneal gamma to train without spatial context first
-        alpha_ramp_start: int = 50,
-        alpha_ramp_end: int = 100,
+        alpha_ramp_start: int = 0,
+        alpha_ramp_end: int = 0,
         alpha_max: float = 1,
-        gamma_ramp_start: int = 0,
-        gamma_ramp_end: int = 0,
+        gamma_ramp_start: int = 50,
+        gamma_ramp_end: int = 100,
         gamma_max: float = 1,
         
         # Training kwargs
         max_epochs: int = 1000,
         grad_clip_norm: float = 1.0,
+        log_every: int = 20,
         
         # Other kwargs:
         device: str = 'auto',
@@ -176,10 +177,33 @@ class SpatialAutoencoderTrainer:
             
         self.dataset = SpatialDataset.from_graph(
             self.graph,
-            layer = self.layer,
             batch_key = f'{self.batch_key}_int' if self.batch_key else None,
         )
-
+        
+        self.train_dataset = SpatialDataset.from_graph(
+            self.graph,
+            cell_indices = self.graph.split_idx['train_idx'],
+            batch_key = f'{self.batch_key}_int' if self.batch_key else None,
+        )
+        
+        self.val_dataset = SpatialDataset.from_graph(
+            self.graph,
+            cell_indices = self.graph.split_idx['val_idx'],
+            batch_key = f'{self.batch_key}_int' if self.batch_key else None,
+        )
+        
+        self.test_dataset = SpatialDataset.from_graph(
+            self.graph,
+            cell_indices = self.graph.split_idx['test_idx'],
+            batch_key = f'{self.batch_key}_int' if self.batch_key else None,
+        )
+        
+        self.X = self.adata.X if self.layer is None else self.adata.layers[self.layer]
+        if issparse(self.X):
+            self.X = self.X.toarray()
+        self.X = torch.from_numpy(self.X)
+            
+        
     def _setup_dataloaders(self):
         if self.dataset is None:
             self._setup_dataset()
@@ -197,65 +221,37 @@ class SpatialAutoencoderTrainer:
                 generator = g
             )
 
-        train_graph, train_idx = self.graph.slice_by_index(self.graph.split_idx['train_idx'])
         self.train_loader = DataLoader(
-            SpatialDataset.from_graph(
-                train_graph,
-                cell_indices = train_idx, 
-                batch_key = f'{self.batch_key}_int' if self.batch_key else None,
-                layer = self.layer,
-            ),
-            
+            self.train_dataset,
             sampler = make_stratified_sampler(self.graph.split_idx['train_idx']),
             batch_size = self.batch_size,
             num_workers = self.num_workers,
-            pin_memory = (self.device.type == 'cuda'),
+            #pin_memory = (self.device.type == 'cuda'),
             collate_fn = lambda x: x,
-            persistent_workers = (self.num_workers > 0),
+            #persistent_workers = (self.num_workers > 0),
         )
         
-        test_graph, test_idx = self.graph.slice_by_index(self.graph.split_idx['test_idx'])
         self.test_loader = DataLoader(
-            SpatialDataset.from_graph(
-                test_graph,
-                cell_indices = test_idx,
-                batch_key = f'{self.batch_key}_int' if self.batch_key else None,
-                layer = self.layer,
-            ),
+            self.test_dataset,
             batch_size = self.batch_size,
-            num_workers = self.num_workers,
-            pin_memory = (self.device.type == 'cuda'),
             drop_last = False,
             shuffle = False,
             collate_fn = lambda x: x,
-            persistent_workers = (self.num_workers > 0),
         )
         
-        val_graph, val_idx = self.graph.slice_by_index(self.graph.split_idx['val_idx'])
         self.val_loader = DataLoader(
-            SpatialDataset.from_graph(
-                val_graph,
-                cell_indices = val_idx,
-                batch_key = f'{self.batch_key}_int' if self.batch_key else None,
-                layer = self.layer,
-            ),
+            self.val_dataset,
             batch_size = self.batch_size,
-            num_workers = self.num_workers,
-            pin_memory = (self.device.type == 'cuda'),
             drop_last = False,
             shuffle = False,
             collate_fn = lambda x: x,
-            persistent_workers = (self.num_workers > 0),
         )
         
         self.dataloader = DataLoader(
             self.dataset,
             batch_size = self.batch_size,
-            num_workers = self.num_workers,
-            pin_memory = (self.device.type == 'cuda'),
             shuffle = False,
             collate_fn = lambda x: x,
-            persistent_workers = (self.num_workers > 0),
         )
         
     def _setup_model(self):
@@ -306,6 +302,77 @@ class SpatialAutoencoderTrainer:
             delta = self.delta,
         ).to(self.device)
         
+        
+    def forward_batch(self, batch, alpha = 1, gamma = 1, embedding_only = False, verbose = False):
+            
+        cell_idx = batch['cell_idx']
+        neighbor_idx = batch['neighbor_idx']
+        neighbor_mask = batch['neighbor_mask']
+        distances = batch['distances'].to(self.device)
+        log_library_size = batch['log_library_size'].to(self.device)
+        batch_label = batch['batch_label'].to(self.device)
+
+        # Get all unique indices (central + neighbors), keep on cpu since full expression matrix is on cpu
+        neighbor_idx_flat = neighbor_idx[neighbor_mask]
+        all_needed_idx = torch.cat([cell_idx, neighbor_idx_flat], dim = 0)
+        unique_idx, inverse = torch.unique(all_needed_idx, sorted = True, return_inverse = True)
+
+        # Get expression for all unique cells in batch and move to gpu
+        cell_idx = cell_idx.to(self.device)
+        neighbor_idx = neighbor_idx.to(self.device)
+        neighbor_mask = neighbor_mask.to(self.device)
+        unique_X = self.X[unique_idx].to(self.device)
+
+        # Forward pass to encode all Z
+        unique_mu, unique_log_var = self.model.encoder(unique_X)
+        unique_z = self.model.reparameterize(unique_mu, unique_log_var)            
+
+        # Get central embeddings
+        central_inverse = inverse[:cell_idx.shape[0]]
+        cell_z = unique_z[central_inverse]
+        mu_z = unique_mu[central_inverse]
+        log_var = unique_mu[central_inverse]
+        
+        # Get neighbor embeddings
+        neighbor_inverse = inverse[cell_idx.shape[0]:]
+        neighbor_z = torch.zeros(
+            (cell_idx.shape[0], neighbor_idx.shape[1], cell_z.shape[1]),
+            device = self.device,
+            dtype = cell_z.dtype
+        )
+        neighbor_z[neighbor_mask] = unique_z[neighbor_inverse]
+        
+        has_neighbors = neighbor_mask.any(dim = -1)
+        post_attn_z = cell_z.clone()
+        
+        weights = None
+        if has_neighbors.any():
+            context, weights = self.model.attention(
+                central_z = cell_z[has_neighbors],
+                neighbor_z = neighbor_z[has_neighbors],
+                neighbor_mask = neighbor_mask[has_neighbors],
+                distances = distances[has_neighbors],
+            )
+            post_attn_z[has_neighbors] *= alpha
+            post_attn_z[has_neighbors] += gamma * torch.sigmoid(self.model.delta) * context
+
+        if embedding_only:
+            return cell_z, post_attn_z
+
+        mu_x, theta, pi = self.model.decode(post_attn_z, log_library_size, batch_label)
+        
+        return {
+            'mu_z': mu_z,
+            'log_var': log_var,
+            'mu_x': mu_x,
+            'theta': theta,
+            'pi': pi,
+            'pre_attn_z': cell_z,
+            'post_attn_z': post_attn_z,
+            'cell_X': unique_X[central_inverse],
+            'attn_weights': weights
+        }
+        
     def train(self, random_state: int = 42, verbose: bool = True):
         
         set_random_seed(random_state, self.device)
@@ -320,39 +387,21 @@ class SpatialAutoencoderTrainer:
             beta_kl = get_anneal_ramp_param(epoch, self.beta_ramp_start, self.beta_ramp_end, self.beta_kl_max, method = 'cosine')
             alpha = get_anneal_ramp_param(epoch, self.alpha_ramp_start, self.alpha_ramp_end, self.alpha_max, method = 'cosine')
             gamma = get_anneal_ramp_param(epoch, self.gamma_ramp_start, self.gamma_ramp_end, self.gamma_max, method = 'cosine')
+            pre_model = deepcopy(self.model.state_dict())
             self.model.train()
             for i, batch in enumerate(self.train_loader):
                 # Update progress bar description in 20% batch increments
-                if (i % max(1, len(self.train_loader) // 5)) == 0 or (i == len(self.train_loader) - 1):
+                if (max(i, 1) % max(1, len(self.train_loader) // 5)) == 0 or (i == len(self.train_loader) - 1):
                     pbar.set_description(f'Running training loop: batch = {i+1}/{len(self.train_loader)} (Early stop count = {self.early_stopping.counter})')
-                
-                cell_X = batch['cell_X'].to(self.device)
-                neighbor_X = batch['neighbor_X'].to(self.device)
-                neighbor_mask = batch['neighbor_mask'].to(self.device)
-                distances = batch['distances'].to(self.device)
-                log_library_size = batch['log_library_size'].to(self.device)
-                batch_label = batch['batch_label'].to(self.device)
-                
                 self.optimizer.zero_grad()
-                
-                outputs = self.model(
-                    central_X = cell_X,
-                    neighbor_X = neighbor_X,
-                    neighbor_mask = neighbor_mask,
-                    distances = distances,
-                    log_library_size = log_library_size,
-                    batch_label = batch_label,
-                    alpha = alpha,
-                    gamma = gamma,
-                )
-                
+                outputs = self.forward_batch(batch, alpha = alpha, gamma = gamma)
                 loss, recon_loss, kl_loss = self.loss(
                     outputs['mu_z'],
                     outputs['log_var'],
                     outputs['mu_x'],
                     outputs['theta'],
                     outputs['pi'],
-                    cell_X,
+                    outputs['cell_X'],
                     beta_kl,
                 )
                     
@@ -361,13 +410,26 @@ class SpatialAutoencoderTrainer:
                     self.model.parameters(),
                     max_norm = self.grad_clip_norm
                 )
+                
                 self.optimizer.step()
-                n = len(cell_X)
+                n = batch['cell_idx'].shape[0]
                 n_train += n
                 train_loss += n * loss.item()
                 train_recon += n * recon_loss
                 train_kl += n * kl_loss
-                
+                is_finite = True
+                for name, p in self.model.named_parameters():
+                    if not torch.isfinite(p).all():
+                        print("Nonfinite parameter:", name)
+                        print("nan:", torch.isnan(p).sum().item())
+                        print("+inf:", (p == float("inf")).sum().item())
+                        print("-inf:", (p == float("-inf")).sum().item())
+                        is_finite = False
+                if not is_finite:
+                    np.save('/common/lamt2/attention/cell_idx.npy', batch['cell_idx'].detach().cpu().numpy())
+                    torch.save(self.model.state_dict(), '/common/lamt2/attention/model.pt')
+                    torch.save(pre_model, '/common/lamt2/attention/model_best.pt')
+                    raise RuntimeError(f"Nonfinite parameters")
             train_loss /= n_train
             train_recon /= n_train
             train_kl /= n_train
@@ -377,40 +439,23 @@ class SpatialAutoencoderTrainer:
             val_loss = 0.0
             val_recon = 0.0
             val_kl = 0.0
-            pbar.set_description(f'Running validation loop (Early stop count = {self.early_stopping.counter})')
-
             self.model.eval()
             with torch.no_grad():
                 for batch in self.val_loader:
-                # Update progress bar description in 20% batch increments
-                    cell_X = batch['cell_X'].to(self.device)
-                    neighbor_X = batch['neighbor_X'].to(self.device)
-                    neighbor_mask = batch['neighbor_mask'].to(self.device)
-                    distances = batch['distances'].to(self.device)
-                    log_library_size = batch['log_library_size'].to(self.device)
-                    batch_label = batch['batch_label'].to(self.device)
-                    outputs = self.model(
-                        central_X = cell_X,
-                        neighbor_X = neighbor_X,
-                        neighbor_mask = neighbor_mask,
-                        distances = distances,
-                        log_library_size = log_library_size,
-                        batch_label = batch_label,
-                        alpha = alpha,
-                        gamma = gamma,
-                    )
-                    
+                    if (max(1, i) % max(1, len(self.val_loader)) // 2) == 0 or (i == len(self.val_loader) - 1):
+                        pbar.set_description(f'Running validation loop: batch = {i+1}/{len(self.val_loader)} (Early stop count = {self.early_stopping.counter})')
+                    outputs = self.forward_batch(batch, alpha = alpha, gamma = gamma, verbose = False)
                     loss, recon_loss, kl_loss = self.loss(
                         outputs['mu_z'],
                         outputs['log_var'],
                         outputs['mu_x'],
                         outputs['theta'],
                         outputs['pi'],
-                        cell_X,
+                        outputs['cell_X'],
                         beta_kl
                     )
 
-                    n = len(cell_X)
+                    n = batch['cell_idx'].shape[0]
                     n_val += n
                     val_loss += loss.item() * n
                     val_recon += recon_loss * n
@@ -422,7 +467,7 @@ class SpatialAutoencoderTrainer:
             
             if epoch > self.beta_ramp_start:
                 self.scheduler.step(val_loss)
-            if epoch > max(self.alpha_ramp_end, self.beta_ramp_end) + self.early_stop_offset:
+            if epoch > max(self.alpha_ramp_end, self.beta_ramp_end, self.gamma_ramp_end) + self.early_stop_offset:
                 self.early_stopping(val_loss, self.model)
                 
             history.append({
@@ -437,7 +482,8 @@ class SpatialAutoencoderTrainer:
                 'early_stopping': self.early_stopping.counter,
                 'beta_kl': beta_kl,
                 'alpha': alpha,
-                'gamma': gamma
+                'gamma': gamma,
+                'delta': torch.sigmoid(self.model.delta).detach().cpu().numpy()
             })
             if self.early_stopping.early_stop:
                 if verbose:
@@ -462,6 +508,7 @@ class SpatialAutoencoderTrainer:
         beta_kl = self.history['beta_kl'].values
         alpha = self.history['alpha'].values
         gamma = self.history['gamma'].values
+        delta = self.history['delta'].values
         
         fig, ax = plt.subplots(2, 1, figsize = (6, 5), height_ratios = [3, 1])
         
@@ -483,6 +530,7 @@ class SpatialAutoencoderTrainer:
         ax1_1.plot(epochs, (beta_kl) / (beta_kl.max() if beta_kl.max() > 0 else 1), 'C2-', alpha = 0.7, label = r'$\beta_\text{KL}$' + f' [max = {beta_kl.max():.3f}]')
         ax1_1.plot(epochs, (alpha) / (alpha.max() if alpha.max() > 0 else 1), 'm-', alpha = 0.7, label = r'$\alpha$' + f' [max = {alpha.max():.3f}]')
         ax1_1.plot(epochs, (gamma) / (gamma.max() if gamma.max() > 0 else 1), 'C3-', alpha = 0.7, label = r'$\gamma$' + f' [max = {gamma.max():.3f}]')
+        ax1_1.plot(epochs, delta, 'C4', alpha = 0.7, label = r'sigmoid$(\delta)$')
         ax1_1.set_ylabel("Other params [a.u.]")
         ax[1].grid()
         lines, labels = ax[1].get_legend_handles_labels()
@@ -502,32 +550,18 @@ class SpatialAutoencoderTrainer:
         test_kl = 0.0
         self.model.eval()
         for batch in tqdm(self.test_loader, desc = "Evaluating on test dataset"):
-            cell_X = batch['cell_X'].to(self.device)
-            neighbor_X = batch['neighbor_X'].to(self.device)
-            neighbor_mask = batch['neighbor_mask'].to(self.device)
-            distances = batch['distances'].to(self.device)
-            log_library_size = batch['log_library_size'].to(self.device)
-            batch_label = batch['batch_label'].to(self.device)
-            outputs = self.model(
-                central_X = cell_X,
-                neighbor_X = neighbor_X,
-                neighbor_mask = neighbor_mask,
-                distances = distances,
-                log_library_size = log_library_size,
-                batch_label = batch_label,
-            )
-            
+            outputs = self.forward_batch(batch)
             loss, recon_loss, kl_loss = self.loss(
                 outputs['mu_z'],
                 outputs['log_var'],
                 outputs['mu_x'],
                 outputs['theta'],
                 outputs['pi'],
-                cell_X,
+                outputs['cell_X'],
                 self.max_beta_kl
             )
             
-            n = len(cell_X)
+            n = batch['cell_idx'].shape[0]
             n_test += n
             test_loss += n * loss.item()
             test_recon += n * recon_loss
@@ -544,17 +578,7 @@ class SpatialAutoencoderTrainer:
         cell_indices = []
         
         for batch in self.dataloader:
-            cell_X = batch['cell_X'].to(self.device)
-            neighbor_X = batch['neighbor_X'].to(self.device)
-            neighbor_mask = batch['neighbor_mask'].to(self.device)
-            distances = batch['distances'].to(self.device)
-            mu, log_var, pre_z, post_z = self.model.encode(
-                central_X = cell_X,
-                neighbor_X = neighbor_X,
-                neighbor_mask = neighbor_mask,
-                distances = distances
-            )
-            
+            pre_z, post_z = self.forward_batch(batch, embedding_only = True)
             embeddings['pre_attention'].append(pre_z.cpu().numpy())
             embeddings['post_attention'].append(post_z.cpu().numpy())
             cell_indices.append(batch['cell_idx'])
@@ -574,20 +598,7 @@ class SpatialAutoencoderTrainer:
         pi = []
         t1 = time.perf_counter()
         for batch in self.dataloader:
-            cell_X = batch['cell_X'].to(self.device)
-            neighbor_X = batch['neighbor_X'].to(self.device)
-            neighbor_mask = batch['neighbor_mask'].to(self.device)
-            distances = batch['distances'].to(self.device)
-            log_library_size = batch['log_library_size'].to(self.device)
-            batch_label = batch['batch_label'].to(self.device)
-            result = self.model(
-                central_X = cell_X,
-                neighbor_X = neighbor_X,
-                neighbor_mask = neighbor_mask,
-                distances = distances,
-                log_library_size = log_library_size,
-                batch_label = batch_label
-            )
+            result = self.forward_batch(batch)
             x_hat.append(result['mu_x'].cpu().numpy())
             pi.append(result['pi'].cpu().numpy())
             

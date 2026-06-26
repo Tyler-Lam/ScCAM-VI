@@ -56,14 +56,15 @@ class ReconstructionLoss(nn.Module):
     ):
         theta = theta.unsqueeze(0)
         pi = pi.unsqueeze(0)
+        mu = mu.clamp_min(eps)
         log_nb = (
             torch.lgamma(x + theta)
             - torch.lgamma(theta)
             - torch.lgamma(x + 1)
-            + theta * torch.log(theta / (theta + mu + eps))
-            + x * torch.log(mu / (theta + mu + eps))
+            + theta * torch.log(theta / (theta + mu))
+            + x * torch.log(mu / (theta + mu ))
         )
-        log_nb_zero = theta * torch.log( theta / (theta + mu + eps) )
+        log_nb_zero = theta * torch.log( theta / (theta + mu) )
         
         log_zero = torch.log(pi + eps) + log_nb_zero
         log_nonzero = torch.log(1 - pi + eps) + log_nb

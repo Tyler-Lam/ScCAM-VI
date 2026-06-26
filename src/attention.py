@@ -148,4 +148,4 @@ class SpatialCrossAttention(nn.Module):
         )
         
         context = context.squeeze(1)
-        return self.layer_norm(context)
+        return self.layer_norm(context), attn_weights

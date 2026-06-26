@@ -22,28 +22,31 @@ class SpatialDataset(Dataset):
         if self.distances.dtype != np.float32:
             self.distances = self.distances.astype(np.float32)
         self.batch_labels = batch_labels
-        self.X = X
-        if issparse(self.X):
-            self.X = self.X.toarray()
-        self.n_genes = self.X.shape[1]
+        self.n_genes = X.shape[1]
         if cell_indices is None:
-            self.cell_indices = np.arange(self.X.shape[0])
+            self.cell_indices = np.arange(X.shape[0])
         else:
             self.cell_indices = cell_indices
+            
+        if not isinstance(self.cell_indices, np.ndarray):
+            self.cell_indices = np.array(self.cell_indices)
+
         if batch_labels is None:
-            self.batch_labels = np.zeros(self.X.shape[0], dtype = np.int32)
-        self.log_library_size = np.log(np.maximum(self.X.sum(axis = 1), 1))
+            self.batch_labels = np.zeros(X.shape[0], dtype = np.int32)
+        if not issparse(X):
+            self.log_library_size = np.log(np.maximum(X.sum(axis = 1), 1))
+        else:
+            self.log_library_size = np.log(np.maximum(X.toarray().sum(axis = 1), 1))
         self.max_neighbors = np.diff(distances.indptr).max()
 
     @classmethod
     def from_graph(
         self,
         graph: SpatialNeighbors,
-        layer: Optional[str] = None,
         cell_indices: Optional[np.ndarray] = None,
         batch_key: Optional[str] = None,
     ):
-        X = graph.adata.X if layer is None else graph.adata.layers[layer]
+        X = graph.adata.X
         return SpatialDataset(
             X = X,
             distances = graph.adata.obsp[graph.distance_key],
@@ -56,9 +59,7 @@ class SpatialDataset(Dataset):
     
     def __getitem__(self, idx):
         # Central cell index and gene expression
-        cell_idx = self.cell_indices[idx]
-        cell_X = torch.from_numpy(self.X[cell_idx])
-        
+        cell_idx = self.cell_indices[idx]        
         # Batch labels
         batch_label = self.batch_labels[cell_idx]
         
@@ -70,18 +71,14 @@ class SpatialDataset(Dataset):
         n_neighbors = len(neighbor_idxs_all)
         neighbor_dists = np.zeros(self.max_neighbors, dtype = np.float32)
         neighbor_mask = torch.zeros(self.max_neighbors, dtype = torch.bool)
-        neighbor_X = np.zeros((self.max_neighbors, self.n_genes), dtype = np.float32)
 
         neighbor_dists[:n_neighbors] = neighbor_dists_all
         neighbor_mask[:n_neighbors] = True
-        neighbor_X[:n_neighbors] = self.X[neighbor_idxs_all]
         
         log_lib_size = self.log_library_size[cell_idx]
         
         return {
             'cell_idx': cell_idx,
-            'cell_X': cell_X,
-            'neighbor_X': torch.from_numpy(neighbor_X),
             'neighbor_mask': neighbor_mask,
             'distances': torch.from_numpy(neighbor_dists),
             'log_library_size': log_lib_size,
@@ -91,7 +88,6 @@ class SpatialDataset(Dataset):
     def __getitems__(self, idxs):
         
         cell_idx = self.cell_indices[idxs]
-        cell_X = self.X[cell_idx]
         batch_label = self.batch_labels[cell_idx]
         
         starts = self.distances.indptr[cell_idx]
@@ -101,7 +97,7 @@ class SpatialDataset(Dataset):
 
         neighbor_dists = np.zeros((len(idxs), max_neighbors), dtype = np.float32)
         neighbor_mask = np.zeros((len(idxs), max_neighbors), dtype = bool)
-        neighbor_X = np.zeros((len(idxs), max_neighbors, self.n_genes), dtype = np.float32)
+        neighbor_idx = np.full((len(idxs), max_neighbors), -1, dtype = np.int32)
         
         for b, idx in enumerate(cell_idx):
             start = self.distances.indptr[idx]
@@ -115,14 +111,13 @@ class SpatialDataset(Dataset):
             
             neighbor_dists[b, :n_neighbors] = neighbor_dists_all
             neighbor_mask[b, :n_neighbors] = True
-            neighbor_X[b, :n_neighbors] = self.X[neighbor_idxs_all]
+            neighbor_idx[b, :n_neighbors] = neighbor_idxs_all
         
         log_lib_size = self.log_library_size[cell_idx]
         
         return {
             'cell_idx': torch.from_numpy(cell_idx),
-            'cell_X': torch.from_numpy(cell_X),
-            'neighbor_X': torch.from_numpy(neighbor_X),
+            'neighbor_idx': torch.from_numpy(neighbor_idx),
             'neighbor_mask': torch.from_numpy(neighbor_mask),
             'distances': torch.from_numpy(neighbor_dists),
             'log_library_size': torch.from_numpy(log_lib_size),

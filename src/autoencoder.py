@@ -72,6 +72,8 @@ class SpatialAutoEncoder(nn.Module):
             activation = self.activation,
         )
         
+        self.delta = nn.Parameter(torch.tensor(0.0))
+        
     def reparameterize(
         self,
         mu: torch.Tensor,
@@ -91,7 +93,6 @@ class SpatialAutoEncoder(nn.Module):
         neighbor_mask: torch.Tensor,
         distances: torch.Tensor,
         alpha: float = 1.0,
-        gamma: float = 1.0
     ):
 
         mu, log_var = self.encoder(central_X)
@@ -106,9 +107,9 @@ class SpatialAutoEncoder(nn.Module):
         # Mask cells with no neighbors from attention
         has_neighbors = neighbor_mask.any(dim = -1)
         post_attn_z = pre_attn_z.clone()
-        
+        weights = None
         if has_neighbors.any():
-            context = self.attention(
+            context, weights = self.attention(
                 central_z = pre_attn_z[has_neighbors],
                 neighbor_z = neighbor_z[has_neighbors],
                 neighbor_mask = neighbor_mask[has_neighbors],
@@ -116,8 +117,8 @@ class SpatialAutoEncoder(nn.Module):
             )
             
             post_attn_z[has_neighbors] *= alpha
-            post_attn_z[has_neighbors] += gamma * context
-        return mu, log_var, pre_attn_z, post_attn_z
+            post_attn_z[has_neighbors] += gamma * torch.sigmoid(self.delta) * context
+        return mu, log_var, pre_attn_z, post_attn_z, weights
     
     def decode(self,post_attn_z: torch.Tensor, log_library_size: torch.Tensor, batch_labels: Optional[torch.Tensor] = None):
         return self.decoder(post_attn_z, log_library_size, batch_labels)
@@ -131,15 +132,15 @@ class SpatialAutoEncoder(nn.Module):
         log_library_size: torch.Tensor,
         batch_label: torch.Tensor,
         alpha: float = 1.0,
-        gamma: float = 1.0,
+        gamma: float = 1.0
     ):
-        mu_z, log_var, pre_attn_z, post_attn_z = self.encode(
+        mu_z, log_var, pre_attn_z, post_attn_z, attn_weights = self.encode(
             central_X = central_X,
             neighbor_X = neighbor_X,
             neighbor_mask = neighbor_mask,
             distances = distances,
             alpha = alpha,
-            gamma = gamma,
+            gamma = gamma
         )
         
         mu_x, theta, pi = self.decode(post_attn_z, log_library_size, batch_label)
@@ -152,6 +153,7 @@ class SpatialAutoEncoder(nn.Module):
             'pi': pi,
             'pre_attn_z': pre_attn_z,
             'post_attn_z': post_attn_z,
+            'attn_weights': attn_weights
         }
         
     def save(
