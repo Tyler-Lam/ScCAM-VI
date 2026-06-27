@@ -61,6 +61,9 @@ class SpatialAutoencoderTrainer:
         gamma_ramp_start: int = 50,
         gamma_ramp_end: int = 100,
         gamma_max: float = 1,
+        mask_ramp_start: int = 0,
+        mask_ramp_end: int = 0,
+        mask_pct_max: float = 0,
         
         # Training kwargs
         max_epochs: int = 1000,
@@ -129,7 +132,9 @@ class SpatialAutoencoderTrainer:
         self.gamma_max = gamma_max
         self.gamma_ramp_start = gamma_ramp_start
         self.gamma_ramp_end = gamma_ramp_end
-        
+        self.mask_ramp_start = mask_ramp_start
+        self.mask_ramp_end = mask_ramp_end
+        self.mask_pct_max = mask_pct_max
         self.max_epochs = max_epochs
         self.grad_clip_norm = grad_clip_norm
         
@@ -226,9 +231,7 @@ class SpatialAutoencoderTrainer:
             sampler = make_stratified_sampler(self.graph.split_idx['train_idx']),
             batch_size = self.batch_size,
             num_workers = self.num_workers,
-            #pin_memory = (self.device.type == 'cuda'),
             collate_fn = lambda x: x,
-            #persistent_workers = (self.num_workers > 0),
         )
         
         self.test_loader = DataLoader(
@@ -303,7 +306,7 @@ class SpatialAutoencoderTrainer:
         ).to(self.device)
         
         
-    def forward_batch(self, batch, alpha = 1, gamma = 1, embedding_only = False, verbose = False):
+    def forward_batch(self, batch, alpha = 1, gamma = 1, mask_pct = 0.0, embedding_only = False, verbose = False):
             
         cell_idx = batch['cell_idx']
         neighbor_idx = batch['neighbor_idx']
@@ -353,6 +356,11 @@ class SpatialAutoencoderTrainer:
                 neighbor_mask = neighbor_mask[has_neighbors],
                 distances = distances[has_neighbors],
             )
+            mask = torch.bernoulli(
+                torch.full((cell_z.shape[0], 1), 1 - mask_pct, device=cell_z.device)
+            )
+            
+            post_attn_z[has_neighbors] *= mask[has_neighbors]
             post_attn_z[has_neighbors] *= alpha
             post_attn_z[has_neighbors] += gamma * torch.sigmoid(self.model.delta) * context
 
@@ -387,14 +395,14 @@ class SpatialAutoencoderTrainer:
             beta_kl = get_anneal_ramp_param(epoch, self.beta_ramp_start, self.beta_ramp_end, self.beta_kl_max, method = 'cosine')
             alpha = get_anneal_ramp_param(epoch, self.alpha_ramp_start, self.alpha_ramp_end, self.alpha_max, method = 'cosine')
             gamma = get_anneal_ramp_param(epoch, self.gamma_ramp_start, self.gamma_ramp_end, self.gamma_max, method = 'cosine')
-            pre_model = deepcopy(self.model.state_dict())
+            mask_pct = get_anneal_ramp_param(epoch, self.mask_ramp_start, self.mask_ramp_end, self.mask_pct_max, method = 'cosine')
             self.model.train()
             for i, batch in enumerate(self.train_loader):
                 # Update progress bar description in 20% batch increments
                 if (max(i, 1) % max(1, len(self.train_loader) // 5)) == 0 or (i == len(self.train_loader) - 1):
                     pbar.set_description(f'Running training loop: batch = {i+1}/{len(self.train_loader)} (Early stop count = {self.early_stopping.counter})')
                 self.optimizer.zero_grad()
-                outputs = self.forward_batch(batch, alpha = alpha, gamma = gamma)
+                outputs = self.forward_batch(batch, alpha = alpha, gamma = gamma, mask_pct = mask_pct)
                 loss, recon_loss, kl_loss = self.loss(
                     outputs['mu_z'],
                     outputs['log_var'],
@@ -417,19 +425,7 @@ class SpatialAutoencoderTrainer:
                 train_loss += n * loss.item()
                 train_recon += n * recon_loss
                 train_kl += n * kl_loss
-                is_finite = True
-                for name, p in self.model.named_parameters():
-                    if not torch.isfinite(p).all():
-                        print("Nonfinite parameter:", name)
-                        print("nan:", torch.isnan(p).sum().item())
-                        print("+inf:", (p == float("inf")).sum().item())
-                        print("-inf:", (p == float("-inf")).sum().item())
-                        is_finite = False
-                if not is_finite:
-                    np.save('/common/lamt2/attention/cell_idx.npy', batch['cell_idx'].detach().cpu().numpy())
-                    torch.save(self.model.state_dict(), '/common/lamt2/attention/model.pt')
-                    torch.save(pre_model, '/common/lamt2/attention/model_best.pt')
-                    raise RuntimeError(f"Nonfinite parameters")
+
             train_loss /= n_train
             train_recon /= n_train
             train_kl /= n_train
@@ -467,7 +463,7 @@ class SpatialAutoencoderTrainer:
             
             if epoch > self.beta_ramp_start:
                 self.scheduler.step(val_loss)
-            if epoch > max(self.alpha_ramp_end, self.beta_ramp_end, self.gamma_ramp_end) + self.early_stop_offset:
+            if epoch > max(self.alpha_ramp_end, self.beta_ramp_end, self.gamma_ramp_end, self.mask_ramp_end) + self.early_stop_offset:
                 self.early_stopping(val_loss, self.model)
                 
             history.append({
@@ -483,7 +479,8 @@ class SpatialAutoencoderTrainer:
                 'beta_kl': beta_kl,
                 'alpha': alpha,
                 'gamma': gamma,
-                'delta': torch.sigmoid(self.model.delta).detach().cpu().numpy()
+                'delta': torch.sigmoid(self.model.delta).detach().cpu().numpy().mean(),
+                'mask_pct': mask_pct
             })
             if self.early_stopping.early_stop:
                 if verbose:
@@ -509,6 +506,7 @@ class SpatialAutoencoderTrainer:
         alpha = self.history['alpha'].values
         gamma = self.history['gamma'].values
         delta = self.history['delta'].values
+        mask_pct = self.history['mask_pct'].values
         
         fig, ax = plt.subplots(2, 1, figsize = (6, 5), height_ratios = [3, 1])
         
@@ -531,6 +529,7 @@ class SpatialAutoencoderTrainer:
         ax1_1.plot(epochs, (alpha) / (alpha.max() if alpha.max() > 0 else 1), 'm-', alpha = 0.7, label = r'$\alpha$' + f' [max = {alpha.max():.3f}]')
         ax1_1.plot(epochs, (gamma) / (gamma.max() if gamma.max() > 0 else 1), 'C3-', alpha = 0.7, label = r'$\gamma$' + f' [max = {gamma.max():.3f}]')
         ax1_1.plot(epochs, delta, 'C4', alpha = 0.7, label = r'sigmoid$(\delta)$')
+        ax1_1.plot(epochs, mask_pct / (mask_pct.max() if mask_pct.max() > 0 else 1), 'C1-', alpha = 0.7, label = 'Mask Pct')
         ax1_1.set_ylabel("Other params [a.u.]")
         ax[1].grid()
         lines, labels = ax[1].get_legend_handles_labels()

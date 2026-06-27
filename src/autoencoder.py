@@ -72,7 +72,7 @@ class SpatialAutoEncoder(nn.Module):
             activation = self.activation,
         )
         
-        self.delta = nn.Parameter(torch.tensor(0.0))
+        self.delta = nn.Parameter(torch.zeros(self.latent_dim))
         
     def reparameterize(
         self,
@@ -93,6 +93,8 @@ class SpatialAutoEncoder(nn.Module):
         neighbor_mask: torch.Tensor,
         distances: torch.Tensor,
         alpha: float = 1.0,
+        gamma: float = 1.0,
+        mask_pct: float = 0.0,
     ):
 
         mu, log_var = self.encoder(central_X)
@@ -116,6 +118,11 @@ class SpatialAutoEncoder(nn.Module):
                 distances = distances[has_neighbors]
             )
             
+            mask = torch.bernoulli(
+                torch.full((pre_attn_z.shape[0], 1), 1 - mask_pct, device=pre_attn_z.device)
+            )
+            
+            post_attn_z[has_neighbors] *= mask[has_neighbors]
             post_attn_z[has_neighbors] *= alpha
             post_attn_z[has_neighbors] += gamma * torch.sigmoid(self.delta) * context
         return mu, log_var, pre_attn_z, post_attn_z, weights
@@ -132,7 +139,8 @@ class SpatialAutoEncoder(nn.Module):
         log_library_size: torch.Tensor,
         batch_label: torch.Tensor,
         alpha: float = 1.0,
-        gamma: float = 1.0
+        gamma: float = 1.0,
+        mask_pct: float = 0.0
     ):
         mu_z, log_var, pre_attn_z, post_attn_z, attn_weights = self.encode(
             central_X = central_X,
@@ -140,7 +148,8 @@ class SpatialAutoEncoder(nn.Module):
             neighbor_mask = neighbor_mask,
             distances = distances,
             alpha = alpha,
-            gamma = gamma
+            gamma = gamma,
+            mask_pct = mask_pct
         )
         
         mu_x, theta, pi = self.decode(post_attn_z, log_library_size, batch_label)

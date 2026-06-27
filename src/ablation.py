@@ -4,6 +4,7 @@ from training import *
 import warnings
 from itertools import combinations
 from scipy.special import factorial
+from scipy.stats import spearmanr
 from torch.cuda.amp import autocast
 from tqdm import tqdm
 
@@ -97,7 +98,7 @@ class SpatialAblation:
                     neighbor_mask = neighbor_mask[has_neighbors],
                     distances = distances[has_neighbors],
                 )
-                post_attn_z[has_neighbors] += torch.sigmoid(self.model.gamma) * context
+                post_attn_z[has_neighbors] += torch.sigmoid(self.model.delta) * context
             
             mu_x, theta, pi = self.model.decode(post_attn_z, log_library_size, batch_label)
             out.append(mu_x.cpu().numpy())
@@ -156,7 +157,7 @@ class SpatialAblation:
                     neighbor_mask = neighbor_mask[has_neighbors],
                     distances = distances[has_neighbors],
                 )
-                post_attn_z[has_neighbors] += torch.sigmoid(self.model.gamma) * context
+                post_attn_z[has_neighbors] += torch.sigmoid(self.model.delta) * context
             
             mu_x, theta, pi = self.model.decode(post_attn_z, log_library_size, batch_label)
             out.append(mu_x.cpu().numpy())
@@ -205,7 +206,7 @@ class SpatialAblation:
                     neighbor_mask = neighbor_mask[has_neighbors],
                     distances = distances[has_neighbors],
                 )
-                post_attn_z[has_neighbors] += torch.sigmoid(self.model.gamma) * context
+                post_attn_z[has_neighbors] += torch.sigmoid(self.model.delta) * context
             
             prev_x, *_ = self.model.decode(post_attn_z, log_library_size, batch_label)
             
@@ -236,7 +237,7 @@ class SpatialAblation:
                         neighbor_mask = neighbor_mask[has_neighbors],
                         distances = distances[has_neighbors],
                     )
-                    post_attn_z[has_neighbors] += torch.sigmoid(self.model.gamma) * context
+                    post_attn_z[has_neighbors] += torch.sigmoid(self.model.delta) * context
                 
                 current_x, *_ = self.model.decode(post_attn_z, log_library_size, batch_label)
                 scores[c].append((prev_x - current_x).cpu().numpy())
@@ -264,3 +265,162 @@ class SpatialAblation:
         
         scores = {c: scores[c] / n_iter for c in scores}
         return scores
+    
+    def run_ablation_exact(
+        self,
+        category = str,
+        method: Literal['mask', 'mean', 'zero'] = 'mean',
+    ):
+        unique_categories = self.adata.obs[category].unique()
+        permutations = minimal_ablation_permutations(unique_categories)
+        
+        baseline = self._run_with_mask(ablation_idxs = np.array([]), method = method)
+        
+        scores = {cat: np.zeros(self.adata.shape, dtype = np.float32) for cat in unique_categories}
+        
+        prev_coalitions = []
+    
+    def get_scores_df(
+        self,
+        scores: dict[np.ndarray],
+        category: str,
+        central_category: str,
+        neighbor_category: str,
+        connectivities_key: str = 'spatial_connectivities',
+        min_neighbors: int = 1,
+    ):
+        central_mask = (self.adata.obs[category] == central_category).values
+        central_idx = np.where(central_mask)[0]
+        neighbor_mask = (self.adata.obs[category] == neighbor_category).values
+        neighbor_idx = np.where(neighbor_mask)[0]
+
+        n_neighbors = np.zeros(self.adata.shape[0], dtype = np.int32)
+        for i in central_idx:
+            start = self.adata.obsp[connectivities_key].indptr[i]
+            end = self.adata.obsp[connectivities_key].indptr[i + 1]
+            n_neighbors[i] = neighbor_mask[self.adata.obsp[connectivities_key].indices[start:end]].sum()
+
+        n_neighbor_mask = n_neighbors >= min_neighbors
+        
+        means = scores[neighbor_category][central_mask & n_neighbor_mask].mean(axis = 0)
+        stds = scores[neighbor_category][central_mask & n_neighbor_mask].std(axis = 0)
+        medians = np.median(scores[neighbor_category][central_mask & n_neighbor_mask], axis = 0)
+        out_df = pd.DataFrame({'mean': means, 'std': stds, 'median': medians}, index = self.adata.var_names)
+        
+        return out_df
+    
+    
+    def plot_scores(
+        self,
+        scores: dict[np.ndarray],
+        gene: str,
+        category: str,
+        central_category: str,
+        connectivities_key: str = 'spatial_connectivities',
+        min_neighbors: int = 1,
+        x_label: str = 'x_centroid',
+        y_label: str = 'y_centroid',
+        method: Literal['mask', 'mean', 'zero'] = 'mean',
+        log: bool = False
+    ):
+        gene_idx = np.where(self.adata.var_names == gene)[0][0]
+        central_mask = (self.adata.obs[category] == central_category).values
+        central_idx = np.where(central_mask)[0]
+        bdata = self.adata[central_mask].copy()
+        s = 120000 / bdata.shape[0]
+        n_celltypes = len(self.adata.obs[category].unique())
+        fig, ax = plt.subplots(n_celltypes+1, 3, figsize = (20, 4 * n_celltypes), width_ratios = [2, 2, 1], constrained_layout = True)
+        fig.suptitle(f"{central_category}")
+        mappable = ax[0,0].scatter(
+            x = bdata.obs[x_label],
+            y = bdata.obs[y_label],
+            c = bdata[:,gene_idx].X.toarray(),
+            s = s,
+            linewidths = 0,
+            cmap = 'viridis',
+            edgecolors = 'none',
+        )
+        ax[0,0].set_aspect("equal")
+        ax[0,0].set_title(f"Normalized {gene} count")
+        fig.colorbar(mappable, ax = ax[0,0], label = 'Normalized Count', pad = 0.001)
+        
+        prediction = self._run_with_mask(ablation_idxs = np.array([]), method = method)
+        baseline = self._run_with_mask(ablation_idxs = np.arange(self.adata.shape[0]), method = method)
+        mappable = ax[0,1].scatter(
+            x = bdata.obs[x_label],
+            y = bdata.obs[y_label],
+            c = prediction[central_mask, gene_idx] - baseline[central_mask, gene_idx],
+            vmin = np.percentile(prediction[central_mask, gene_idx] - baseline[central_mask, gene_idx], 1),
+            vmax = np.percentile(prediction[central_mask, gene_idx] - baseline[central_mask, gene_idx], 99),
+            s = s,
+            linewidths = 0,
+            cmap = 'viridis',
+            edgecolors = 'none',
+        )
+        ax[0,1].set_aspect("equal")
+        ax[0,1].set_title(f"Prediction - Baseline {gene} count")
+        fig.colorbar(mappable, ax = ax[0,1], label = 'Delta', pad = 0.001)
+        
+        fig.delaxes(ax[0,2])
+        
+        scores_all = np.concatenate([scores[c][:,gene_idx] for c in scores])
+        vmin = np.percentile(scores_all, 1)
+        vmax = np.percentile(scores_all, 99)
+        
+        for n, neighbor_category in enumerate(self.adata.obs[category].unique()):
+        
+            neighbor_mask = (self.adata.obs[category] == neighbor_category).values
+            neighbor_idx = np.where(neighbor_mask)[0]
+            
+            n_neighbors = np.zeros(self.adata.shape[0], dtype = np.int32)
+            for i in central_idx:
+                start = self.adata.obsp[connectivities_key].indptr[i]
+                end = self.adata.obsp[connectivities_key].indptr[i + 1]
+                n_neighbors[i] = neighbor_mask[self.adata.obsp[connectivities_key].indices[start:end]].sum()
+
+            bdata.obs['n_neighbors'] = n_neighbors[central_mask]
+            counts = bdata[:,gene_idx].X.toarray()
+            s = 120000 / bdata.shape[0]
+            # Plotting number of neighbors
+            mappable = ax[n+1,0].scatter(
+                x = bdata.obs[x_label],
+                y = bdata.obs[y_label],
+                c = bdata.obs['n_neighbors'],
+                s = s,
+                linewidths = 0,
+                cmap = 'viridis',
+                edgecolors = 'none',
+            )
+            ax[n+1,0].set_aspect("equal")
+            ax[n+1,0].set_title(f"Neighboring {neighbor_category}")
+            fig.colorbar(mappable, ax = ax[n+1,0], label = 'n_neighbors', pad = 0.001)
+
+            
+            neighbor_scores = scores[neighbor_category][central_mask][bdata.obs['n_neighbors'] >= min_neighbors, gene_idx]
+            mappable = ax[n+1,1].scatter(
+                x = bdata.obs[x_label],
+                y = bdata.obs[y_label],
+                c = scores[neighbor_category][central_mask][:,gene_idx],
+                vmin = vmin, 
+                vmax = vmax,
+                s = s,
+                cmap = 'coolwarm',
+                edgecolors = 'none'
+            )
+            fig.colorbar(mappable, ax = ax[n+1,1], label = "SHAP score", pad = 0.001)
+            ax[n+1,1].set_aspect("equal")
+            ax[n+1,1].set_title(f'SHAP scores for {neighbor_category}')
+            
+            r = spearmanr(scores[neighbor_category][central_mask][:,gene_idx], bdata.obs['n_neighbors'].values).statistic
+            ax[n+1,2].scatter(
+                x = scores[neighbor_category][central_mask][:,gene_idx],
+                y = bdata.obs['n_neighbors'],
+                s = s / 4,
+            )
+            ax[n+1,2].set_xlabel("SHAP score")
+            ax[n+1,2].set_ylabel("N_neighbors")
+            ax[n+1,2].set_title(f'N_neighbors vs {neighbor_category} SHAP score (spearman r = {r:.3f})')
+            ax[n+1,2].set_xlim(vmin, vmax)
+            ax[n+1,2].grid()
+            
+        return fig
