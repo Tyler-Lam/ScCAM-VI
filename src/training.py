@@ -327,14 +327,11 @@ class SpatialAutoencoderTrainer:
         unique_X = self.X[unique_idx].to(self.device)
 
         # Forward pass to encode all Z
-        unique_mu, unique_log_var = self.model.encoder(unique_X)
-        unique_z = self.model.reparameterize(unique_mu, unique_log_var)            
+        unique_z = self.model.encoder(unique_X)
 
         # Get central embeddings
         central_inverse = inverse[:cell_idx.shape[0]]
         cell_z = unique_z[central_inverse]
-        mu_z = unique_mu[central_inverse]
-        log_var = unique_mu[central_inverse]
         
         # Get neighbor embeddings
         neighbor_inverse = inverse[cell_idx.shape[0]:]
@@ -345,6 +342,7 @@ class SpatialAutoencoderTrainer:
         )
         neighbor_z[neighbor_mask] = unique_z[neighbor_inverse]
         
+        # post_attention_z = alpna * mask * pre_attention_z + gamma * sigmoid(delta) * context
         has_neighbors = neighbor_mask.any(dim = -1)
         post_attn_z = cell_z.clone()
         
@@ -356,18 +354,25 @@ class SpatialAutoencoderTrainer:
                 neighbor_mask = neighbor_mask[has_neighbors],
                 distances = distances[has_neighbors],
             )
+            
+            # Randomly mask pre-attention embeddings to force spatial awareness
             mask = torch.bernoulli(
                 torch.full((cell_z.shape[0], 1), 1 - mask_pct, device=cell_z.device)
             )
-            
             post_attn_z[has_neighbors] *= mask[has_neighbors]
+            
             post_attn_z[has_neighbors] *= alpha
             post_attn_z[has_neighbors] += gamma * torch.sigmoid(self.model.delta) * context
 
+        mu = self.model.mu(post_attn_z)
+        log_var = self.model.log_var(post_attn_z)
+        
+        mu_z = self.model.reparameterize(mu, log_var)
+        
         if embedding_only:
-            return cell_z, post_attn_z
+            return mu_z, cell_z, post_attn_z
 
-        mu_x, theta, pi = self.model.decode(post_attn_z, log_library_size, batch_label)
+        mu_x, theta, pi = self.model.decode(mu_z, log_library_size, batch_label)
         
         return {
             'mu_z': mu_z,
@@ -529,7 +534,7 @@ class SpatialAutoencoderTrainer:
         ax1_1.plot(epochs, (alpha) / (alpha.max() if alpha.max() > 0 else 1), 'm-', alpha = 0.7, label = r'$\alpha$' + f' [max = {alpha.max():.3f}]')
         ax1_1.plot(epochs, (gamma) / (gamma.max() if gamma.max() > 0 else 1), 'C3-', alpha = 0.7, label = r'$\gamma$' + f' [max = {gamma.max():.3f}]')
         ax1_1.plot(epochs, delta, 'C4', alpha = 0.7, label = r'sigmoid$(\delta)$')
-        ax1_1.plot(epochs, mask_pct / (mask_pct.max() if mask_pct.max() > 0 else 1), 'C1-', alpha = 0.7, label = 'Mask Pct')
+        ax1_1.plot(epochs, mask_pct, 'C1-', alpha = 0.7, label = 'Mask Pct')
         ax1_1.set_ylabel("Other params [a.u.]")
         ax[1].grid()
         lines, labels = ax[1].get_legend_handles_labels()
@@ -571,18 +576,20 @@ class SpatialAutoencoderTrainer:
         return test_loss, test_recon, test_kl
     
     @torch.no_grad()
-    def get_embedding(self):
+    def get_embedding(self, alpha = 1.0, gamma = 1.0):
         self.model.eval()
-        embeddings = {'pre_attention': [], 'post_attention': []}
+        embeddings = {'z': [], 'pre_attention': [], 'post_attention': []}
         cell_indices = []
         
         for batch in self.dataloader:
-            pre_z, post_z = self.forward_batch(batch, embedding_only = True)
+            z, pre_z, post_z = self.forward_batch(batch, embedding_only = True, alpha = alpha, gamma = gamma)
+            embeddings['z'].append(z.cpu().numpy())
             embeddings['pre_attention'].append(pre_z.cpu().numpy())
             embeddings['post_attention'].append(post_z.cpu().numpy())
             cell_indices.append(batch['cell_idx'])
             
         self.embedding = {
+            'z': np.concatenate(embeddings['z'], axis = 0),
             'pre_attention': np.concatenate(embeddings['pre_attention'], axis = 0),
             'post_attention': np.concatenate(embeddings['post_attention'], axis = 0),
             'cell_idx': np.concatenate(cell_indices, axis = 0)
@@ -591,13 +598,13 @@ class SpatialAutoencoderTrainer:
         return self.embedding
     
     @torch.no_grad()
-    def predict(self):
+    def predict(self, alpha = 1.0, gamma = 1.0):
         self.model.eval()
         x_hat = []
         pi = []
         t1 = time.perf_counter()
         for batch in self.dataloader:
-            result = self.forward_batch(batch)
+            result = self.forward_batch(batch, alpha = alpha, gamma = gamma)
             x_hat.append(result['mu_x'].cpu().numpy())
             pi.append(result['pi'].cpu().numpy())
             

@@ -7,6 +7,7 @@ from scipy.special import factorial
 from scipy.stats import spearmanr
 from torch.cuda.amp import autocast
 from tqdm import tqdm
+import matplotlib.colors as colors
 
 class SpatialAblation:
     def __init__(
@@ -17,6 +18,7 @@ class SpatialAblation:
         
         self.model = trainer.model
         self.adata = trainer.adata
+        self.layer = trainer.layer
         self.device = trainer.device
         self.batch_size = batch_size if batch_size is not None else len(self.adata)
         self.model.eval()
@@ -100,7 +102,10 @@ class SpatialAblation:
                 )
                 post_attn_z[has_neighbors] += torch.sigmoid(self.model.delta) * context
             
-            mu_x, theta, pi = self.model.decode(post_attn_z, log_library_size, batch_label)
+            mu = self.model.mu(post_attn_z)
+            log_var = self.model.log_var(post_attn_z)
+            mu_z = self.model.reparameterize(mu, log_var)
+            mu_x, theta, pi = self.model.decode(mu_z, log_library_size, batch_label)
             out.append(mu_x.cpu().numpy())
         
         out = np.concatenate(out)
@@ -159,7 +164,10 @@ class SpatialAblation:
                 )
                 post_attn_z[has_neighbors] += torch.sigmoid(self.model.delta) * context
             
-            mu_x, theta, pi = self.model.decode(post_attn_z, log_library_size, batch_label)
+            mu = self.model.mu(post_attn_z)
+            log_var = self.model.log_var(post_attn_z)
+            mu_z = self.model.reparameterize(mu, log_var)
+            mu_x, theta, pi = self.model.decode(mu_z, log_library_size, batch_label)
             out.append(mu_x.cpu().numpy())
         
         out = np.concatenate(out)
@@ -208,7 +216,10 @@ class SpatialAblation:
                 )
                 post_attn_z[has_neighbors] += torch.sigmoid(self.model.delta) * context
             
-            prev_x, *_ = self.model.decode(post_attn_z, log_library_size, batch_label)
+            mu = self.model.mu(post_attn_z)
+            log_var = self.model.log_var(post_attn_z)
+            mu_z = self.model.reparameterize(mu, log_var)
+            prev_x, *_ = self.model.decode(mu_z, log_library_size, batch_label)
             
             for c in coalition:
                 # Get the ablation mask for the coalition
@@ -239,7 +250,8 @@ class SpatialAblation:
                     )
                     post_attn_z[has_neighbors] += torch.sigmoid(self.model.delta) * context
                 
-                current_x, *_ = self.model.decode(post_attn_z, log_library_size, batch_label)
+                mu = self.model.mu(post_attn_z)
+                current_x, *_ = self.model.decode(mu, log_library_size, batch_label)
                 scores[c].append((prev_x - current_x).cpu().numpy())
                 prev_x = current_x
         scores = {c: np.concatenate(scores[c]) for c in scores}
@@ -364,9 +376,11 @@ class SpatialAblation:
         fig.delaxes(ax[0,2])
         
         scores_all = np.concatenate([scores[c][:,gene_idx] for c in scores])
-        vmin = np.percentile(scores_all, 1)
-        vmax = np.percentile(scores_all, 99)
-        
+        vmin = np.percentile(scores_all, 5)
+        vmax = np.percentile(scores_all, 95)
+        vmax_sym = max(abs(vmin), abs(vmax))
+        symnorm = colors.SymLogNorm(linthresh=1.0, linscale=1.0, vmin=-vmax_sym, vmax=vmax_sym, base=10)
+
         for n, neighbor_category in enumerate(self.adata.obs[category].unique()):
         
             neighbor_mask = (self.adata.obs[category] == neighbor_category).values
@@ -395,21 +409,22 @@ class SpatialAblation:
             ax[n+1,0].set_title(f"Neighboring {neighbor_category}")
             fig.colorbar(mappable, ax = ax[n+1,0], label = 'n_neighbors', pad = 0.001)
 
-            
+            # Potting scatterplot by shap score
             neighbor_scores = scores[neighbor_category][central_mask][bdata.obs['n_neighbors'] >= min_neighbors, gene_idx]
             mappable = ax[n+1,1].scatter(
                 x = bdata.obs[x_label],
                 y = bdata.obs[y_label],
                 c = scores[neighbor_category][central_mask][:,gene_idx],
-                vmin = vmin, 
-                vmax = vmax,
+                #vmin = -vmax_sym, 
+                #vmax = vmax_sym,
+                norm = symnorm,
                 s = s,
                 cmap = 'coolwarm',
                 edgecolors = 'none'
             )
             fig.colorbar(mappable, ax = ax[n+1,1], label = "SHAP score", pad = 0.001)
             ax[n+1,1].set_aspect("equal")
-            ax[n+1,1].set_title(f'SHAP scores for {neighbor_category}')
+            ax[n+1,1].set_title(f'{gene} SHAP scores for {neighbor_category}')
             
             r = spearmanr(scores[neighbor_category][central_mask][:,gene_idx], bdata.obs['n_neighbors'].values).statistic
             ax[n+1,2].scatter(
@@ -417,10 +432,77 @@ class SpatialAblation:
                 y = bdata.obs['n_neighbors'],
                 s = s / 4,
             )
+            ax[n+1,2].set_xlim(-vmax_sym, vmax_sym)
             ax[n+1,2].set_xlabel("SHAP score")
             ax[n+1,2].set_ylabel("N_neighbors")
             ax[n+1,2].set_title(f'N_neighbors vs {neighbor_category} SHAP score (spearman r = {r:.3f})')
-            ax[n+1,2].set_xlim(vmin, vmax)
             ax[n+1,2].grid()
             
         return fig
+    
+    @torch.no_grad()
+    def get_ablated_embedding(
+        self,
+        method: Literal['mask', 'mean', 'zero'] = 'mean',
+        show_progress: bool = False
+    ):
+        ablation_idxs = np.arange(self.adata.shape[0])
+        self.model.eval()
+        out = []
+        
+        for batch in self.dataloader:
+            cell_idx = batch['cell_idx']
+            neighbor_idx = batch['neighbor_idx']
+            neighbor_mask = batch['neighbor_mask']
+            distances = batch['distances'].to(self.device)
+            log_library_size = batch['log_library_size'].to(self.device)
+            batch_label = batch['batch_label'].to(self.device)
+            
+            cell_z = self.embedding_tensor[cell_idx].to(self.device)
+            
+            # Do neighbor and ablation mask calculations on cpu, then move to cpu
+            neighbor_z = torch.zeros(
+                (cell_idx.shape[0], neighbor_idx.shape[1], cell_z.shape[1]),
+                dtype = cell_z.dtype
+            )
+            neighbor_z[neighbor_mask] = self.embedding_tensor[neighbor_idx[neighbor_mask]]
+            
+            ablation_mask = torch.zeros(
+                (cell_idx.shape[0], neighbor_idx.shape[1]),
+                dtype = torch.bool
+            )
+            
+            ablation_mask[neighbor_mask] = torch.isin(neighbor_idx[neighbor_mask], torch.from_numpy(ablation_idxs))
+
+            if method == 'mask':
+                neighbor_mask[ablation_mask] = False
+            elif method == 'mean':
+                neighbor_z[ablation_mask] = self.mean_z
+            elif method == 'zero':
+                neighbor_z[ablation_mask] = self.null_z
+            else:
+                raise ValueError(f'Invalid ablation method given: {method}')
+            
+            # Move to gpu
+            neighbor_mask = neighbor_mask.to(self.device)
+            cell_z = cell_z.to(self.device)
+            neighbor_z = neighbor_z.to(self.device)
+            post_attn_z = cell_z.clone()
+
+            has_neighbors = neighbor_mask.any(dim = -1)
+            if has_neighbors.any():
+                context, weights = self.model.attention(
+                    central_z = cell_z[has_neighbors],
+                    neighbor_z = neighbor_z[has_neighbors],
+                    neighbor_mask = neighbor_mask[has_neighbors],
+                    distances = distances[has_neighbors],
+                )
+                post_attn_z[has_neighbors] += torch.sigmoid(self.model.delta) * context
+            
+            mu = self.model.mu(post_attn_z)
+            log_var = self.model.log_var(post_attn_z)
+            mu_z = self.model.reparameterize(mu, log_var)
+            out.append(mu_z.cpu().numpy())
+        
+        out = np.concatenate(out)
+        return out

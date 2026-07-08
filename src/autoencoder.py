@@ -72,6 +72,9 @@ class SpatialAutoEncoder(nn.Module):
             activation = self.activation,
         )
         
+        self.mu = nn.Linear(self.latent_dim, self.latent_dim)
+        self.log_var = nn.Linear(self.latent_dim, self.latent_dim)
+        
         self.delta = nn.Parameter(torch.zeros(self.latent_dim))
         
     def reparameterize(
@@ -97,13 +100,12 @@ class SpatialAutoEncoder(nn.Module):
         mask_pct: float = 0.0,
     ):
 
-        mu, log_var = self.encoder(central_X)
-        pre_attn_z = self.reparameterize(mu, log_var)
+        pre_attn_z = self.encoder(central_X)
+
         batch_size, max_neighbors, n_genes = neighbor_X.shape
         
         neighbor_X_flat = neighbor_X.view(-1, n_genes)
-        neighbor_mu_flat, neighbor_log_var_flat = self.encoder(neighbor_X_flat)
-        neighbor_z_flat = self.reparameterize(neighbor_mu_flat, neighbor_log_var_flat)
+        neighbor_z_flat = self.encoder(neighbor_X_flat)
         neighbor_z = neighbor_z_flat.view(batch_size, max_neighbors, self.latent_dim)
         
         # Mask cells with no neighbors from attention
@@ -125,6 +127,10 @@ class SpatialAutoEncoder(nn.Module):
             post_attn_z[has_neighbors] *= mask[has_neighbors]
             post_attn_z[has_neighbors] *= alpha
             post_attn_z[has_neighbors] += gamma * torch.sigmoid(self.delta) * context
+            
+        mu = self.mu(post_attn_z)
+        log_var = self.log_var(post_attn_z)
+        
         return mu, log_var, pre_attn_z, post_attn_z, weights
     
     def decode(self,post_attn_z: torch.Tensor, log_library_size: torch.Tensor, batch_labels: Optional[torch.Tensor] = None):
@@ -151,6 +157,8 @@ class SpatialAutoEncoder(nn.Module):
             gamma = gamma,
             mask_pct = mask_pct
         )
+        
+        post_attn_z = self.reparameterize(mu_z, log_var)
         
         mu_x, theta, pi = self.decode(post_attn_z, log_library_size, batch_label)
         
