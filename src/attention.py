@@ -78,19 +78,25 @@ class SpatialCrossAttention(nn.Module):
     def __init__(
         self,
         latent_dim: int,
+        attn_dim: Optional[int] = None,
         num_heads: int = 1,
         dropout: float = 0.1,
         d_min: float = 0,
         d_max: float = 1,
         rbf_n_basis: int = 16,
         rbf_spacing: Literal['log', 'linear'] = 'log',
-        need_weights: bool = True
+        need_weights: bool = True,
+        project_inputs: bool = True
     ):
         super().__init__()
         
-        if latent_dim % num_heads != 0:
-            raise ValueError(f'Latent dimension ({latent_dim}) must be divisible by num_heads ({num_heads})')
+
         self.latent_dim = latent_dim
+        self.attn_dim = latent_dim if attn_dim is None else attn_dim
+        if self.attn_dim % num_heads != 0:
+            raise ValueError(f'Attention dimension ({self.attn_dim}) must be divisible by num_heads ({num_heads})')
+        if self.attn_dim != self.latent_dim and not project_inputs:
+            raise ValueError(f'project_inputs must be True if latent_dim ({self.latent_dim}) != attn_dim ({self.attn_dim})')
         self.num_heads = num_heads
         self.dropout = dropout
         self.d_min = d_min
@@ -98,9 +104,18 @@ class SpatialCrossAttention(nn.Module):
         self.rbf_n_basis = rbf_n_basis
         self.rbf_spacing = rbf_spacing
         self.need_weights = need_weights
+        self.project_inputs = project_inputs
         
+        self.query_proj = None
+        self.key_proj = None
+        self.value_proj = None
+        if self.project_inputs:
+            self.query_proj = nn.Linear(self.latent_dim, self.attn_dim)
+            self.key_proj = nn.Linear(self.latent_dim, self.attn_dim)
+            self.value_proj = nn.Linear(self.latent_dim, self.attn_dim)
+
         self.attention = nn.MultiheadAttention(
-            embed_dim = latent_dim,
+            embed_dim = self.attn_dim,
             num_heads = num_heads,
             dropout = dropout,
             batch_first = True
@@ -114,7 +129,7 @@ class SpatialCrossAttention(nn.Module):
             trainable = True
         )
         
-        self.layer_norm = nn.LayerNorm(latent_dim)
+        self.layer_norm = nn.LayerNorm(self.attn_dim)
         
     def forward(
         self,
@@ -123,9 +138,14 @@ class SpatialCrossAttention(nn.Module):
         neighbor_mask: torch.Tensor,
         distances: torch.Tensor
     ):
-        query = central_z.unsqueeze(1)
-        key = neighbor_z
-        value = neighbor_z
+        if self.project_inputs:
+            query = self.query_proj(central_z).unsqueeze(1)
+            key = self.key_proj(neighbor_z)
+            value = self.value_proj(neighbor_z)
+        else:
+            query = central_z.unsqueeze(1)
+            key = neighbor_z
+            value = neighbor_z
 
         padding_mask = torch.zeros(
             neighbor_mask.shape[0], 1, neighbor_mask.shape[1], dtype = torch.float32, device = central_z.device

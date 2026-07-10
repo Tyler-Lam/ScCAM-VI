@@ -38,10 +38,10 @@ class MLPEncoder(nn.Module):
                 layers.append(nn.Dropout(self.dropout))
         self.encoder = nn.Sequential(*layers)
         self.mu = nn.Linear(dims[-1], self.latent_dim)
-        #self.log_var = nn.Linear(dims[-1], self.latent_dim)
+        self.log_var = nn.Linear(dims[-1], self.latent_dim)
         
     def forward(self, x: torch.Tensor):
         h = self.encoder(x)
         mu = self.mu(h)
-        #log_var = self.log_var(h)
-        return mu#, log_var
+        log_var = self.log_var(h)
+        return mu, log_var

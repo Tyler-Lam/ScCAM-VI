@@ -14,6 +14,7 @@ class SpatialDataset(Dataset):
         self,
         X: csr_matrix | np.ndarray,
         distances: csr_matrix,
+        celltype_labels: Optional[np.ndarray] = None,
         cell_indices: Optional[np.ndarray] = None, # Only get cell indicies from this array
         batch_labels: Optional[np.ndarray] = None,
     ):
@@ -22,6 +23,7 @@ class SpatialDataset(Dataset):
         if self.distances.dtype != np.float32:
             self.distances = self.distances.astype(np.float32)
         self.batch_labels = batch_labels
+        self.celltype_labels = celltype_labels
         self.n_genes = X.shape[1]
         if cell_indices is None:
             self.cell_indices = np.arange(X.shape[0])
@@ -33,6 +35,8 @@ class SpatialDataset(Dataset):
 
         if batch_labels is None:
             self.batch_labels = np.zeros(X.shape[0], dtype = np.int32)
+        if celltype_labels is None:
+            self.celltype_labels = np.zeros(X.shape[0], dtype = np.int32)
         if not issparse(X):
             self.log_library_size = np.log(np.maximum(X.sum(axis = 1), 1))
         else:
@@ -44,6 +48,7 @@ class SpatialDataset(Dataset):
         self,
         graph: SpatialNeighbors,
         cell_indices: Optional[np.ndarray] = None,
+        celltype_key: Optional[str] = None,
         batch_key: Optional[str] = None,
     ):
         X = graph.adata.X
@@ -51,6 +56,7 @@ class SpatialDataset(Dataset):
             X = X,
             distances = graph.adata.obsp[graph.distance_key],
             cell_indices = cell_indices,
+            celltype_labels = graph.adata.obs[celltype_key].values if celltype_key is not None else None,
             batch_labels = graph.adata.obs[batch_key].values if batch_key is not None else None,
         )
     
@@ -62,7 +68,7 @@ class SpatialDataset(Dataset):
         cell_idx = self.cell_indices[idx]        
         # Batch labels
         batch_label = self.batch_labels[cell_idx]
-        
+        cell_label = self.celltype_labels[cell_idx]
         # Get all neighbor indices/distances
         start = self.distances.indptr[cell_idx]
         end = self.distances.indptr[cell_idx + 1]
@@ -79,6 +85,7 @@ class SpatialDataset(Dataset):
         
         return {
             'cell_idx': cell_idx,
+            'celltype_label': cell_label,
             'neighbor_mask': neighbor_mask,
             'distances': torch.from_numpy(neighbor_dists),
             'log_library_size': log_lib_size,
@@ -88,6 +95,8 @@ class SpatialDataset(Dataset):
     def __getitems__(self, idxs):
         
         cell_idx = self.cell_indices[idxs]
+        
+        celltype_label = self.celltype_labels[cell_idx]
         batch_label = self.batch_labels[cell_idx]
         
         starts = self.distances.indptr[cell_idx]
@@ -121,5 +130,6 @@ class SpatialDataset(Dataset):
             'neighbor_mask': torch.from_numpy(neighbor_mask),
             'distances': torch.from_numpy(neighbor_dists),
             'log_library_size': torch.from_numpy(log_lib_size),
+            'celltype_label': torch.from_numpy(celltype_label),
             'batch_label': torch.from_numpy(batch_label)
         }

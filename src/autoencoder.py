@@ -10,12 +10,24 @@ from attention import *
 from decoder import *
 from loss import *
 
+class CellTypePrior(nn.Module):
+    def __init__(self, n_celltypes: int, latent_dim: int):
+        super().__init__()
+        self.prior_mu = nn.Embedding(n_celltypes, latent_dim)
+        nn.init.zeros_(self.prior_mu.weight)
+
+    def forward(self, celltype_idx):
+        return self.prior_mu(celltype_idx)
+    
 class SpatialAutoEncoder(nn.Module):
     def __init__(
         self,
         n_genes: int,
         latent_dim: int,
+        n_celltypes: int = 1,
         hidden_dims: List[int] = [],
+        attn_dim: Optional[int] = None,
+        project_inputs: bool = True,
         num_heads: int = 1,
         dropout: float = 0.1,
         n_batches: int = 1,
@@ -31,6 +43,9 @@ class SpatialAutoEncoder(nn.Module):
         self.n_genes = n_genes
         self.latent_dim = latent_dim
         self.hidden_dims = hidden_dims
+        self.attn_dim = attn_dim
+        self.project_inputs = project_inputs
+        self.n_celltypes = n_celltypes
         self.n_batches = n_batches
         self.batch_dim = batch_dim
         self.dropout = dropout
@@ -43,6 +58,11 @@ class SpatialAutoEncoder(nn.Module):
         
         if isinstance(hidden_dims, int):
             self.hidden_dims = [self.hidden_dims]
+            
+        self.celltype_prior = CellTypePrior(
+            n_celltypes = n_celltypes,
+            latent_dim = latent_dim
+        )
 
         self.encoder = MLPEncoder(
             n_genes = self.n_genes,
@@ -55,6 +75,8 @@ class SpatialAutoEncoder(nn.Module):
         self.attention = SpatialCrossAttention(
             latent_dim = self.latent_dim,
             num_heads = self.num_heads,
+            attn_dim = self.attn_dim,
+            project_inputs = self.project_inputs,
             dropout = self.dropout,
             d_min = self.d_min,
             d_max = self.d_max,
@@ -65,6 +87,7 @@ class SpatialAutoEncoder(nn.Module):
         self.decoder = MLPDecoder(
             latent_dim = self.latent_dim,
             n_genes = self.n_genes,
+            attn_dim = self.attn_dim,
             hidden_dims = self.hidden_dims[::-1],
             n_batches = self.n_batches,
             batch_dims = self.batch_dim,
@@ -75,7 +98,8 @@ class SpatialAutoEncoder(nn.Module):
         self.mu = nn.Linear(self.latent_dim, self.latent_dim)
         self.log_var = nn.Linear(self.latent_dim, self.latent_dim)
         
-        self.delta = nn.Parameter(torch.zeros(self.latent_dim))
+        # Vector gate for attention model
+        self.gamma = nn.Parameter(torch.zeros(self.latent_dim))
         
     def reparameterize(
         self,
@@ -95,46 +119,36 @@ class SpatialAutoEncoder(nn.Module):
         neighbor_X: torch.Tensor,
         neighbor_mask: torch.Tensor,
         distances: torch.Tensor,
-        alpha: float = 1.0,
-        gamma: float = 1.0,
-        mask_pct: float = 0.0,
     ):
 
-        pre_attn_z = self.encoder(central_X)
+        mu_z, log_var = self.encoder(central_X)
+        z_intrinsic = self.reparameterize(mu_z, log_var)
 
         batch_size, max_neighbors, n_genes = neighbor_X.shape
         
         neighbor_X_flat = neighbor_X.view(-1, n_genes)
-        neighbor_z_flat = self.encoder(neighbor_X_flat)
-        neighbor_z = neighbor_z_flat.view(batch_size, max_neighbors, self.latent_dim)
+        neighbor_z_flat, _ = self.encoder(neighbor_X_flat)
+        neighbor_z = neighbor_z_flat.view(batch_size, max_neighbors, self.latent_dim).detach()
         
         # Mask cells with no neighbors from attention
         has_neighbors = neighbor_mask.any(dim = -1)
-        post_attn_z = pre_attn_z.clone()
+        z_spatial = torch.zeros((z_intrinsic.shape[0], self.attn_dim), dtype = torch.float32, device = z_intrinsic.device)
         weights = None
         if has_neighbors.any():
+            query = z_intrinsic[has_neighbors].detach()
             context, weights = self.attention(
-                central_z = pre_attn_z[has_neighbors],
-                neighbor_z = neighbor_z[has_neighbors],
+                central_z = query,
+                neighbor_z = neighbor_z,
                 neighbor_mask = neighbor_mask[has_neighbors],
                 distances = distances[has_neighbors]
             )
-            
-            mask = torch.bernoulli(
-                torch.full((pre_attn_z.shape[0], 1), 1 - mask_pct, device=pre_attn_z.device)
-            )
-            
-            post_attn_z[has_neighbors] *= mask[has_neighbors]
-            post_attn_z[has_neighbors] *= alpha
-            post_attn_z[has_neighbors] += gamma * torch.sigmoid(self.delta) * context
-            
-        mu = self.mu(post_attn_z)
-        log_var = self.log_var(post_attn_z)
+
+            z_spatial[has_neighbors] = context
         
-        return mu, log_var, pre_attn_z, post_attn_z, weights
+        return mu_z, log_var, z_intrinsic, z_spatial, weights
     
-    def decode(self,post_attn_z: torch.Tensor, log_library_size: torch.Tensor, batch_labels: Optional[torch.Tensor] = None):
-        return self.decoder(post_attn_z, log_library_size, batch_labels)
+    def decode(self, z_intrinsic: torch.Tensor, z_spatial: torch.Tensor, log_library_size: torch.Tensor, batch_labels: Optional[torch.Tensor] = None, alpha = 1.0):
+        return self.decoder(z_intrinsic, z_spatial, log_library_size, batch_labels, alpha = alpha)
     
     def forward(
         self,
@@ -144,32 +158,31 @@ class SpatialAutoEncoder(nn.Module):
         distances: torch.Tensor,
         log_library_size: torch.Tensor,
         batch_label: torch.Tensor,
+        celltype_label: torch.Tensor,
         alpha: float = 1.0,
-        gamma: float = 1.0,
-        mask_pct: float = 0.0
     ):
-        mu_z, log_var, pre_attn_z, post_attn_z, attn_weights = self.encode(
+
+        mu_z_prior = self.celltype_prior(celltype_label)
+        
+        mu_z, log_var, z_intrinsic, z_spatial, attn_weights = self.encode(
             central_X = central_X,
             neighbor_X = neighbor_X,
             neighbor_mask = neighbor_mask,
             distances = distances,
-            alpha = alpha,
-            gamma = gamma,
-            mask_pct = mask_pct
         )
-        
-        post_attn_z = self.reparameterize(mu_z, log_var)
-        
-        mu_x, theta, pi = self.decode(post_attn_z, log_library_size, batch_label)
+
+        mu, theta, pi, mu_intrinsic, lfc = self.decode(z_intrinsic, z_spatial, log_library_size, batch_label, alpha = alpha)
         
         return {
+            'mu_z_prior': mu_z_prior,
             'mu_z': mu_z,
             'log_var': log_var,
-            'mu_x' : mu_x,
+            'mu' : mu,
             'theta': theta,
             'pi': pi,
-            'pre_attn_z': pre_attn_z,
-            'post_attn_z': post_attn_z,
+            'mu_intrinsic': mu_intrinsic,
+            'lfc': lfc,
+            'z_spatial': z_spatial,
             'attn_weights': attn_weights
         }
         

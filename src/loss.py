@@ -4,47 +4,19 @@ import torch.nn.functional as F
 from typing import Optional, Literal
 
 class ReconstructionLoss(nn.Module):
-    def __init__(
-        self,
-        loss_fn: Literal['mse', 'huber', 'zinb'] = 'zinb',
-        delta: float = 1.0,
-        mask_weight: float = 0.5,
-    ):
+    def __init__(self):
         super().__init__()
-        self.loss_fn = loss_fn
-        self.delta = delta
-        self.mask_weight = mask_weight
                 
     def kl_divergence(
         self,
         mu: torch.Tensor,
-        log_var: torch.Tensor
+        log_var: torch.Tensor,
+        mu_prior: torch.Tensor,
     ):
         kl = 0.5 * (
-            log_var.exp() + mu.pow(2) - 1 - log_var
+            log_var.exp() + (mu - mu_prior).pow(2) - 1 - log_var
         ).sum(dim = -1)
         return kl.mean()
-            
-    def mse_loss(
-        self,
-        x_hat: torch.Tensor,
-        x: torch.Tensor
-    ):
-        sq_err = (x_hat - x) ** 2
-        if self.gene_weights is not None:
-            sq_error = sq_error * self.gene_weights.unsqueeze(0)
-        
-        return sq_error.mean()
-    
-    def huber_loss(
-        self,
-        x_hat: torch.Tensor,
-        x: torch.Tensor
-    ):
-        loss = F.huber_loss(x_hat, x, reduction = 'none', delta = self.delta)
-        if self.gene_weights is not None:
-            loss *= self.gene_weights.unsqueeze(0)
-        return loss
     
     def zinb_nll(
         self,
@@ -75,28 +47,41 @@ class ReconstructionLoss(nn.Module):
 
         return -ll
         
+        
     def forward(
         self,
-        mu_z: torch.Tensor,
+        mu_z_prior: torch.Tensor,
+        z: torch.Tensor,
         log_var: torch.Tensor,
-        mu_x: torch.Tensor,
+        mu: torch.Tensor,
+        mu_intrinsic: torch.Tensor,
+        delta: torch.Tensor,
         pi: torch.Tensor,
         theta: torch.Tensor,
         x: torch.Tensor,
         beta_kl: float = 1.0,
-        gene_mask: Optional[torch.Tensor] = None,
+        gamma: float = 1.0,
+        lambda_mu_prior: float = 1e-3,
+        lambda_delta: float = 1e-3,
     ):
-        loss_kl = self.kl_divergence(mu_z, log_var)
-        if self.loss_fn == 'mse':
-            loss_recon = self.mse_loss(mu_x, x)
-        elif self.loss_fn == 'huber':
-            loss_recon = self.huber_loss(mu_x, x)
-        elif self.loss_fn == 'zinb':
-            loss_recon = self.zinb_nll(x, mu_x, theta, pi)
-        else:
-            raise ValueError(f'Loss function must be one of ["mse", "huber", "zinb"]. Given {self.loss_fn}')
+        # KL Divergence on latent space
+        loss_kl = self.kl_divergence(z, log_var, mu_z_prior)
+        # L1 regularization on latent means priors
+        loss_prior_reg = mu_z_prior.abs().mean()
+        # zinb nll loss
+        loss_recon = self.zinb_nll(x, mu, theta, pi)
+        # zinb nll loss on intrinsic predictions
+        loss_recon_intrinsic = self.zinb_nll(x, mu_intrinsic, theta, pi)
+        # L1 regularization on log fold changes
+        loss_delta_reg = delta.abs().sum(dim = -1).mean()
         
-        if gene_mask is not None:
-            loss_recon[gene_mask] *= self.mask_weight
-            #loss_recon = torch.where(gene_mask, loss_recon * self.mask_weight, loss_recon)
-        return loss_recon.sum(dim = -1).mean() + beta_kl * loss_kl.mean(), loss_recon.sum(dim = -1).mean().item(), loss_kl.mean().item()
+        # Total loss
+        loss = loss_recon.sum(dim = -1).mean() + gamma * loss_recon_intrinsic.sum(dim = -1).mean() + beta_kl * loss_kl + loss_kl.mean() + lambda_mu_prior * loss_prior_reg + lambda_delta * loss_delta_reg
+        return {
+            'loss': loss,
+            'loss_recon': loss_recon.sum(dim = -1).mean().item(),
+            'loss_recon_intrinsic': loss_recon_intrinsic.sum(dim = -1).mean().item(),
+            'loss_kl': loss_kl.mean().item(),
+            'loss_prior_reg': loss_prior_reg.item(),
+            'loss_delta_reg': loss_delta_reg.item()
+        }

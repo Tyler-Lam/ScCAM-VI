@@ -14,12 +14,12 @@ def set_random_seed(seed=42, device = 'cpu'):
         torch.backends.cudnn.deterministic = True     
         torch.backends.cudnn.benchmark = False
         
-def get_anneal_ramp_param(epoch, ramp_start, ramp_end, max_param, method: Literal['cosine', 'linear'] = 'linear'):
+def get_anneal_ramp_param(epoch, ramp_start, ramp_end, max_param, min_param = 0, method: Literal['cosine', 'linear'] = 'linear'):
     t = np.clip((epoch - ramp_start) / (ramp_end - ramp_start), a_min = 0, a_max = 1) if ramp_end != ramp_start else 1
     if method == 'linear':
-        return max_param * t
+        return (max_param - min_param) * t + min_param
     elif method == 'cosine':
-        return max_param * 1/2 * (1 - np.cos(np.pi * t))
+        return (max_param - min_param) * 1/2 * (1 - np.cos(np.pi * t)) + min_param
     else:
         raise ValueError(f"Annealing method must be one of ['cosine', 'linear']. Got {method}")
 

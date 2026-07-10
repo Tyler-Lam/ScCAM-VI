@@ -8,6 +8,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import os
 import time
+from collections import defaultdict
 
 class SpatialAutoencoderTrainer:
     
@@ -17,6 +18,7 @@ class SpatialAutoencoderTrainer:
 
         # Dataset kwargs:
         batch_key: Optional[str] = None,
+        celltype_key: Optional[str] = None,
         layer: Optional[str] = None,
         
         # Dataloader kwargs:
@@ -26,6 +28,8 @@ class SpatialAutoencoderTrainer:
         # Autoencoder kwargs
         latent_dim: int = 10,
         hidden_dims: List[int] = [],
+        attn_dim: Optional[int] = None,
+        project_inputs: bool = True,
         num_heads: int = 1,
         dropout: float = 0.1,
         batch_dim: int = 5,
@@ -47,23 +51,18 @@ class SpatialAutoencoderTrainer:
         early_stop_offset: int = 25,
         
         # Loss kwargs
-        loss_fn: Literal['mse', 'huber', 'zinb'] = 'zinb',
-        delta: float = 1.0,
-        beta_kl_max: float = 5,
+        beta_kl_max: float = 1,
         beta_ramp_start: int = 25,
-        beta_ramp_end: int = 50,
-        # Post attention embedding = gamma * attention_context + alpha * pre_attention_embedding
-        # Anneal alpha to get spatial context first
-        # Anneal gamma to train without spatial context first
-        alpha_ramp_start: int = 0,
-        alpha_ramp_end: int = 0,
+        beta_ramp_end: int = 75,
+        alpha_ramp_start: int = 100,
+        alpha_ramp_end: int = 150,
         alpha_max: float = 1,
-        gamma_ramp_start: int = 50,
-        gamma_ramp_end: int = 100,
-        gamma_max: float = 1,
-        mask_ramp_start: int = 0,
-        mask_ramp_end: int = 0,
-        mask_pct_max: float = 0,
+        gamma_ramp_start: int = 175,
+        gamma_ramp_end: int = 225,
+        gamma: float = 0.5,
+        lambda_intrinsic: float = 0.75,
+        lambda_mu_prior: float = 1e-3,
+        lambda_delta: float = 1e-3,
         
         # Training kwargs
         max_epochs: int = 1000,
@@ -79,6 +78,7 @@ class SpatialAutoencoderTrainer:
         
         self.random_state = random_state
         self.batch_key = batch_key
+        self.celltype_key = celltype_key
         self.layer = layer
 
         self.batch_size = batch_size
@@ -86,6 +86,8 @@ class SpatialAutoencoderTrainer:
 
         self.latent_dim = latent_dim
         self.hidden_dims = hidden_dims
+        self.attn_dim = attn_dim if attn_dim is not None else latent_dim
+        self.project_inputs = project_inputs
         self.num_heads = num_heads
         self.dropout = dropout
         self.rbf_n_basis = rbf_n_basis
@@ -110,6 +112,15 @@ class SpatialAutoencoderTrainer:
             self.labels = labels
             self.n_batches = len(unique)
             self.graph.adata.obs[f'{self.batch_key}_int'] = labels
+        
+        self.n_celltypes = 1
+        if self.celltype_key:
+            if self.celltype_key not in self.graph.adata.obs:
+                raise ValueError(f"Celltype key {self.celltype_key} not in adata.obs")
+            labels, unique = pd.factorize(self.graph.adata.obs[self.celltype_key])
+            self.celltype_labels = labels
+            self.n_celltypes = len(unique)
+            self.graph.adata.obs[f'{self.celltype_key}_int'] = labels
         self.learning_rate = learning_rate
         self.weigh_decay = weight_decay
         self.lr_patience = lr_patience
@@ -121,20 +132,18 @@ class SpatialAutoencoderTrainer:
         self.early_stop_delta = early_stop_delta   
         self.early_stop_offset = early_stop_offset    
         
-        self.loss_fn = loss_fn
-        self.delta = delta
         self.beta_kl_max = beta_kl_max
         self.beta_ramp_start = beta_ramp_start
         self.beta_ramp_end = beta_ramp_end
         self.alpha_max = alpha_max
         self.alpha_ramp_start = alpha_ramp_start
         self.alpha_ramp_end = alpha_ramp_end
-        self.gamma_max = gamma_max
         self.gamma_ramp_start = gamma_ramp_start
         self.gamma_ramp_end = gamma_ramp_end
-        self.mask_ramp_start = mask_ramp_start
-        self.mask_ramp_end = mask_ramp_end
-        self.mask_pct_max = mask_pct_max
+        self.gamma = gamma
+        self.lambda_intrinsic = lambda_intrinsic
+        self.lambda_mu_prior = lambda_mu_prior
+        self.lambda_delta = lambda_delta
         self.max_epochs = max_epochs
         self.grad_clip_norm = grad_clip_norm
         
@@ -183,23 +192,27 @@ class SpatialAutoencoderTrainer:
         self.dataset = SpatialDataset.from_graph(
             self.graph,
             batch_key = f'{self.batch_key}_int' if self.batch_key else None,
+            celltype_key = f'{self.celltype_key}_int' if self.celltype_key else None,
         )
         
         self.train_dataset = SpatialDataset.from_graph(
             self.graph,
             cell_indices = self.graph.split_idx['train_idx'],
+            celltype_key = f'{self.celltype_key}_int' if self.celltype_key else None,
             batch_key = f'{self.batch_key}_int' if self.batch_key else None,
         )
         
         self.val_dataset = SpatialDataset.from_graph(
             self.graph,
             cell_indices = self.graph.split_idx['val_idx'],
+            celltype_key = f'{self.celltype_key}_int' if self.celltype_key else None,
             batch_key = f'{self.batch_key}_int' if self.batch_key else None,
         )
         
         self.test_dataset = SpatialDataset.from_graph(
             self.graph,
             cell_indices = self.graph.split_idx['test_idx'],
+            celltype_key = f'{self.celltype_key}_int' if self.celltype_key else None,
             batch_key = f'{self.batch_key}_int' if self.batch_key else None,
         )
         
@@ -265,8 +278,11 @@ class SpatialAutoencoderTrainer:
             n_genes = self.adata.shape[1],
             latent_dim = self.latent_dim,
             hidden_dims = self.hidden_dims,
+            attn_dim = self.attn_dim,
+            project_inputs = self.project_inputs,
             num_heads = self.num_heads,
             dropout = self.dropout,
+            n_celltypes = self.n_celltypes,
             n_batches = self.n_batches,
             batch_dim = self.batch_dim,
             d_min  = self.adata.obsp[self.graph.distance_key].data.min(),
@@ -300,21 +316,21 @@ class SpatialAutoencoderTrainer:
         
     def _setup_loss(self):
 
-        self.loss = ReconstructionLoss(
-            loss_fn = self.loss_fn,
-            delta = self.delta,
-        ).to(self.device)
+        self.loss = ReconstructionLoss().to(self.device)
         
         
-    def forward_batch(self, batch, alpha = 1, gamma = 1, mask_pct = 0.0, embedding_only = False, verbose = False):
+    def forward_batch(self, batch, alpha = 1.0, embedding_only = False, verbose = False):
             
         cell_idx = batch['cell_idx']
+        celltype_labels = batch['celltype_label'].to(self.device)
         neighbor_idx = batch['neighbor_idx']
         neighbor_mask = batch['neighbor_mask']
         distances = batch['distances'].to(self.device)
         log_library_size = batch['log_library_size'].to(self.device)
         batch_label = batch['batch_label'].to(self.device)
 
+        mu_z_prior = self.model.celltype_prior(celltype_labels)
+        
         # Get all unique indices (central + neighbors), keep on cpu since full expression matrix is on cpu
         neighbor_idx_flat = neighbor_idx[neighbor_mask]
         all_needed_idx = torch.cat([cell_idx, neighbor_idx_flat], dim = 0)
@@ -327,64 +343,72 @@ class SpatialAutoencoderTrainer:
         unique_X = self.X[unique_idx].to(self.device)
 
         # Forward pass to encode all Z
-        unique_z = self.model.encoder(unique_X)
+        unique_mu_z, unique_log_var_z = self.model.encoder(unique_X)
 
         # Get central embeddings
         central_inverse = inverse[:cell_idx.shape[0]]
-        cell_z = unique_z[central_inverse]
+        z_intrinsic = self.model.reparameterize(unique_mu_z[central_inverse], unique_log_var_z[central_inverse])
         
         # Get neighbor embeddings
         neighbor_inverse = inverse[cell_idx.shape[0]:]
         neighbor_z = torch.zeros(
-            (cell_idx.shape[0], neighbor_idx.shape[1], cell_z.shape[1]),
+            (cell_idx.shape[0], neighbor_idx.shape[1], z_intrinsic.shape[1]),
             device = self.device,
-            dtype = cell_z.dtype
+            dtype = z_intrinsic.dtype
         )
-        neighbor_z[neighbor_mask] = unique_z[neighbor_inverse]
+        neighbor_z[neighbor_mask] = unique_mu_z[neighbor_inverse].detach()
         
-        # post_attention_z = alpna * mask * pre_attention_z + gamma * sigmoid(delta) * context
         has_neighbors = neighbor_mask.any(dim = -1)
-        post_attn_z = cell_z.clone()
+        z_spatial = torch.zeros((z_intrinsic.shape[0], self.attn_dim), dtype = torch.float32, device = z_intrinsic.device)
         
         weights = None
         if has_neighbors.any():
+            query = z_intrinsic.detach()
             context, weights = self.model.attention(
-                central_z = cell_z[has_neighbors],
+                central_z = query[has_neighbors],
                 neighbor_z = neighbor_z[has_neighbors],
                 neighbor_mask = neighbor_mask[has_neighbors],
                 distances = distances[has_neighbors],
             )
-            
-            # Randomly mask pre-attention embeddings to force spatial awareness
-            mask = torch.bernoulli(
-                torch.full((cell_z.shape[0], 1), 1 - mask_pct, device=cell_z.device)
-            )
-            post_attn_z[has_neighbors] *= mask[has_neighbors]
-            
-            post_attn_z[has_neighbors] *= alpha
-            post_attn_z[has_neighbors] += gamma * torch.sigmoid(self.model.delta) * context
-
-        mu = self.model.mu(post_attn_z)
-        log_var = self.model.log_var(post_attn_z)
-        
-        mu_z = self.model.reparameterize(mu, log_var)
+            z_spatial[has_neighbors] = context
         
         if embedding_only:
-            return mu_z, cell_z, post_attn_z
+            return z_intrinsic, z_spatial
 
-        mu_x, theta, pi = self.model.decode(mu_z, log_library_size, batch_label)
+        mu, theta, pi, mu_intrinsic, delta = self.model.decode(z_intrinsic, z_spatial, log_library_size, batch_label, alpha)
         
         return {
-            'mu_z': mu_z,
-            'log_var': log_var,
-            'mu_x': mu_x,
+            'mu_z_prior': mu_z_prior,
+            'mu_z': z_intrinsic,
+            'log_var': unique_log_var_z[central_inverse],
+            'mu' : mu,
             'theta': theta,
             'pi': pi,
-            'pre_attn_z': cell_z,
-            'post_attn_z': post_attn_z,
+            'mu_intrinsic': mu_intrinsic,
+            'delta': delta,
+            'z_spatial': z_spatial,
+            'attn_weights': weights,
             'cell_X': unique_X[central_inverse],
-            'attn_weights': weights
         }
+        
+    def _calc_loss_from_outputs(self, outputs, beta_kl = 1.0, gamma = 1.0, lambda_mu_prior = 1e-3, lambda_delta = 1e-3):
+        loss = self.loss(
+            outputs['mu_z_prior'],
+            outputs['mu_z'],
+            outputs['log_var'],
+            outputs['mu'],
+            outputs['mu_intrinsic'],
+            outputs['delta'],
+            outputs['pi'],
+            outputs['theta'],
+            outputs['cell_X'],
+            beta_kl,
+            gamma,
+            lambda_mu_prior,
+            lambda_delta
+        )
+        
+        return loss
         
     def train(self, random_state: int = 42, verbose: bool = True):
         
@@ -394,31 +418,21 @@ class SpatialAutoencoderTrainer:
             
             # Training loop
             n_train = 0
-            train_loss = 0.0    
-            train_recon = 0.0
-            train_kl = 0.0   
+            train_loss = defaultdict(float) 
             beta_kl = get_anneal_ramp_param(epoch, self.beta_ramp_start, self.beta_ramp_end, self.beta_kl_max, method = 'cosine')
             alpha = get_anneal_ramp_param(epoch, self.alpha_ramp_start, self.alpha_ramp_end, self.alpha_max, method = 'cosine')
-            gamma = get_anneal_ramp_param(epoch, self.gamma_ramp_start, self.gamma_ramp_end, self.gamma_max, method = 'cosine')
-            mask_pct = get_anneal_ramp_param(epoch, self.mask_ramp_start, self.mask_ramp_end, self.mask_pct_max, method = 'cosine')
+            gamma = get_anneal_ramp_param(epoch, self.gamma_ramp_start, self.gamma_ramp_end, min_param = 1.0, max_param = self.gamma, method = 'cosine')
+            lambda_delta = self.lambda_delta * max(1e-4, alpha)
             self.model.train()
             for i, batch in enumerate(self.train_loader):
                 # Update progress bar description in 20% batch increments
                 if (max(i, 1) % max(1, len(self.train_loader) // 5)) == 0 or (i == len(self.train_loader) - 1):
                     pbar.set_description(f'Running training loop: batch = {i+1}/{len(self.train_loader)} (Early stop count = {self.early_stopping.counter})')
                 self.optimizer.zero_grad()
-                outputs = self.forward_batch(batch, alpha = alpha, gamma = gamma, mask_pct = mask_pct)
-                loss, recon_loss, kl_loss = self.loss(
-                    outputs['mu_z'],
-                    outputs['log_var'],
-                    outputs['mu_x'],
-                    outputs['theta'],
-                    outputs['pi'],
-                    outputs['cell_X'],
-                    beta_kl,
-                )
+                outputs = self.forward_batch(batch)
+                loss= self._calc_loss_from_outputs(outputs, beta_kl, gamma, self.lambda_mu_prior, lambda_delta)
                     
-                loss.backward()
+                loss['loss'].backward()
                 torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(),
                     max_norm = self.grad_clip_norm
@@ -427,65 +441,64 @@ class SpatialAutoencoderTrainer:
                 self.optimizer.step()
                 n = batch['cell_idx'].shape[0]
                 n_train += n
-                train_loss += n * loss.item()
-                train_recon += n * recon_loss
-                train_kl += n * kl_loss
+                for l in loss:
+                    if l == 'loss':
+                        train_loss[l] += n * loss[l].item()
+                    else:
+                        train_loss[l] += n * loss[l]
 
-            train_loss /= n_train
-            train_recon /= n_train
-            train_kl /= n_train
+            for l in train_loss:
+                train_loss[l] /= n_train
             
             # Validation loop
             n_val = 0
-            val_loss = 0.0
-            val_recon = 0.0
-            val_kl = 0.0
+            val_loss = defaultdict(float)
+
             self.model.eval()
             with torch.no_grad():
                 for batch in self.val_loader:
                     if (max(1, i) % max(1, len(self.val_loader)) // 2) == 0 or (i == len(self.val_loader) - 1):
                         pbar.set_description(f'Running validation loop: batch = {i+1}/{len(self.val_loader)} (Early stop count = {self.early_stopping.counter})')
-                    outputs = self.forward_batch(batch, alpha = alpha, gamma = gamma, verbose = False)
-                    loss, recon_loss, kl_loss = self.loss(
-                        outputs['mu_z'],
-                        outputs['log_var'],
-                        outputs['mu_x'],
-                        outputs['theta'],
-                        outputs['pi'],
-                        outputs['cell_X'],
-                        beta_kl
-                    )
+                    outputs = self.forward_batch(batch, verbose = False)
+                    loss = self._calc_loss_from_outputs(outputs, beta_kl, gamma, self.lambda_mu_prior, lambda_delta)
 
                     n = batch['cell_idx'].shape[0]
                     n_val += n
-                    val_loss += loss.item() * n
-                    val_recon += recon_loss * n
-                    val_kl += kl_loss * n
 
-                val_loss /= n_val
-                val_recon /= n_val
-                val_kl /= n_val
-            
+                    for l in loss:
+                        if l == 'loss':
+                            val_loss[l] += n * loss[l].item()
+                        else:
+                            val_loss[l] += n * loss[l]
+
+                for l in val_loss:
+                    val_loss[l] /= n_val
+                
             if epoch > self.beta_ramp_start:
-                self.scheduler.step(val_loss)
-            if epoch > max(self.alpha_ramp_end, self.beta_ramp_end, self.gamma_ramp_end, self.mask_ramp_end) + self.early_stop_offset:
-                self.early_stopping(val_loss, self.model)
+                self.scheduler.step(val_loss['loss'])
+            if epoch > max(self.beta_ramp_end, self.gamma_ramp_end, self.alpha_ramp_end) + self.early_stop_offset:
+                self.early_stopping(val_loss['loss'], self.model)
                 
             history.append({
                 'epoch': epoch,
-                'train_loss': train_loss,
-                'train_recon': train_recon,
-                'train_kl': train_kl,
-                'val_loss': val_loss,
-                'val_recon': val_recon,
-                'val_kl': val_kl,
+                'train_loss': train_loss['loss'],
+                'train_recon': train_loss['loss_recon'],
+                'train_recon_intrinsic': train_loss['loss_recon_intrinsic'],
+                'train_kl': train_loss['loss_kl'],
+                'train_prior_reg': train_loss['loss_prior_reg'],
+                'train_delta_reg': train_loss['loss_delta_reg'],
+                'val_loss': val_loss['loss'],
+                'val_recon': val_loss['loss_recon'],
+                'val_recon_intrinsic': val_loss['loss_recon_intrinsic'],
+                'val_kl': val_loss['loss_kl'],
+                'val_prior_reg': val_loss['loss_prior_reg'],
+                'val_delta_reg': val_loss['loss_delta_reg'],
                 'learning_rate': self.optimizer.param_groups[0]['lr'],
                 'early_stopping': self.early_stopping.counter,
                 'beta_kl': beta_kl,
                 'alpha': alpha,
                 'gamma': gamma,
-                'delta': torch.sigmoid(self.model.delta).detach().cpu().numpy().mean(),
-                'mask_pct': mask_pct
+                'lambda_delta': lambda_delta,
             })
             if self.early_stopping.early_stop:
                 if verbose:
@@ -501,40 +514,49 @@ class SpatialAutoencoderTrainer:
         """
         epochs = self.history['epoch'].values
         train_r = self.history['train_recon'].values
+        train_r_i = self.history['train_recon_intrinsic'].values
+        train_p_r = self.history['train_prior_reg'].values
+        train_d_r = self.history['train_delta_reg'].values
         train_l = self.history['train_loss'].values
         train_k = self.history['train_kl'].values
         val_r = self.history['val_recon'].values
+        val_r_i = self.history['val_recon_intrinsic'].values
+        val_p_r = self.history['val_prior_reg'].values
+        val_d_r = self.history['val_delta_reg'].values
         val_l = self.history['val_loss'].values
         val_k = self.history['val_kl'].values
         lr = self.history['learning_rate'].values
         beta_kl = self.history['beta_kl'].values
         alpha = self.history['alpha'].values
         gamma = self.history['gamma'].values
-        delta = self.history['delta'].values
-        mask_pct = self.history['mask_pct'].values
+        lambda_delta = self.history['lambda_delta'].values
         
         fig, ax = plt.subplots(2, 1, figsize = (6, 5), height_ratios = [3, 1])
         
-        ax[0].plot(epochs, train_l, 'k-', label = 'Train loss')
-        ax[0].plot(epochs, val_l, 'k--', label = 'Validation loss')
-        ax[0].plot(epochs, train_r, 'C0-', label = 'Train Reconstruction loss')
-        ax[0].plot(epochs, val_r, 'C0--', label = 'Validation Reconstruction loss')
-        ax[0].plot(epochs, train_k * beta_kl, 'C2-', label = 'Train KL loss')
-        ax[0].plot(epochs, val_k * beta_kl, 'C2--', label = 'Validation KL loss')
-
+        ax[0].plot(epochs, train_l, 'k-', label = r'$\mathcal{L}_\text{Train}$')
+        ax[0].plot(epochs, val_l, 'k--', label = r'$\mathcal{L}_\text{Val}$')
+        ax[0].plot(epochs, train_r, 'C0-', label = r'$\mathcal{L}_\text{Train}(\text{ZINB})$')
+        ax[0].plot(epochs, val_r, 'C0--', label = r'$\mathcal{L}_\text{Val}(\text{ZINB})$')
+        ax[0].plot(epochs, gamma * train_r_i, 'C1-', label = r'$\gamma*\mathcal{L}_\text{Train}(\text{ZINB}_\text{intr})$')
+        ax[0].plot(epochs, gamma * val_r_i, 'C1--', label = r'$\gamma*\mathcal{L}_\text{Val}(\text{ZINB}_\text{intr})$')
+        ax[0].plot(epochs, beta_kl * train_k, 'C2-', label = r'$\beta_\text{KL}*\mathcal{L}_\text{Train}(\text{KL})$')
+        ax[0].plot(epochs, beta_kl * val_k, 'C2--', label = r'$\beta_\text{KL}*\mathcal{L}_\text{Val}(\text{KL})$')
+        ax[0].plot(epochs, self.lambda_mu_prior * train_p_r, 'C3-', label = r'$\lambda_{z_\mu}*||\mu_{z,i}||_\text{Train}$')
+        ax[0].plot(epochs, self.lambda_mu_prior * val_p_r, 'C3--', label = r'$\lambda_{z_\mu}*||\mu_{z,i}||_\text{Val}$')
+        ax[0].plot(epochs, lambda_delta * train_d_r, 'C4-', label = r'$\lambda_\Delta*||\Delta||_\text{Train}$')
+        ax[0].plot(epochs, lambda_delta * val_d_r, 'C4--', label = r'$\lambda_\Delta*||\Delta||_\text{Val}$')
         ax[0].set_ylabel("Loss")
-
+        ax[0].set_yscale("symlog", linthresh = 1e-3)
         ax[0].legend(loc = 'center left', bbox_to_anchor = [1.15, 0.5])
         ax[0].grid()
         
         ax[1].plot(epochs, lr, 'k-', alpha = 0.7, label = 'Learning Rate')
         ax[1].set_ylabel("Learning Rate")
         ax1_1 = ax[1].twinx()
-        ax1_1.plot(epochs, (beta_kl) / (beta_kl.max() if beta_kl.max() > 0 else 1), 'C2-', alpha = 0.7, label = r'$\beta_\text{KL}$' + f' [max = {beta_kl.max():.3f}]')
-        ax1_1.plot(epochs, (alpha) / (alpha.max() if alpha.max() > 0 else 1), 'm-', alpha = 0.7, label = r'$\alpha$' + f' [max = {alpha.max():.3f}]')
-        ax1_1.plot(epochs, (gamma) / (gamma.max() if gamma.max() > 0 else 1), 'C3-', alpha = 0.7, label = r'$\gamma$' + f' [max = {gamma.max():.3f}]')
-        ax1_1.plot(epochs, delta, 'C4', alpha = 0.7, label = r'sigmoid$(\delta)$')
-        ax1_1.plot(epochs, mask_pct, 'C1-', alpha = 0.7, label = 'Mask Pct')
+        ax1_1.plot(epochs, (beta_kl) / (beta_kl.max() if beta_kl.max() > 0 else 1), 'C2--', alpha = 0.7, label = r'$\beta_\text{KL}$' + f' [max = {beta_kl.max():.3f}]')
+        ax1_1.plot(epochs, (alpha) / (alpha.max() if alpha.max() > 0 else 1), 'C0--', alpha = 0.7, label = r'$\alpha$' + f' [max = {alpha.max():.3f}]')
+        ax1_1.plot(epochs, gamma, 'C1--', alpha = 0.7, label = r'$\gamma$')
+        ax1_1.plot(epochs, (lambda_delta) / (lambda_delta.max() if lambda_delta.max() > 0 else 1), 'C4--', alpha = 0.7, label = r'$\lambda_\Delta$' + f' [max = {lambda_delta.max()}]')
         ax1_1.set_ylabel("Other params [a.u.]")
         ax[1].grid()
         lines, labels = ax[1].get_legend_handles_labels()
@@ -550,71 +572,70 @@ class SpatialAutoencoderTrainer:
     def eval_test(self):
         n_test = 0
         test_loss = 0.0
-        test_recon = 0.0
-        test_kl = 0.0
         self.model.eval()
         for batch in tqdm(self.test_loader, desc = "Evaluating on test dataset"):
             outputs = self.forward_batch(batch)
-            loss, recon_loss, kl_loss = self.loss(
-                outputs['mu_z'],
-                outputs['log_var'],
-                outputs['mu_x'],
-                outputs['theta'],
-                outputs['pi'],
-                outputs['cell_X'],
-                self.max_beta_kl
+            loss, recon_loss, kl_loss = self._calc_loss_from_outputs(
+                outputs,
+                self.max_beta_kl,
+                self.gamma,
+                self.lambda_mu_prior,
+                self.lambda_delta
             )
             
             n = batch['cell_idx'].shape[0]
             n_test += n
-            test_loss += n * loss.item()
-            test_recon += n * recon_loss
-            test_kl += n * kl_loss
+            test_loss += n * loss['loss'].item()
+
         test_loss /= n_test
-        test_recon /= n_test
-        test_kl /= n_test
-        return test_loss, test_recon, test_kl
+
+        return test_loss
     
     @torch.no_grad()
     def get_embedding(self, alpha = 1.0, gamma = 1.0):
         self.model.eval()
-        embeddings = {'z': [], 'pre_attention': [], 'post_attention': []}
+        embeddings = {'z_intrinsic': [], 'z_spatial': []}
         cell_indices = []
         
         for batch in self.dataloader:
-            z, pre_z, post_z = self.forward_batch(batch, embedding_only = True, alpha = alpha, gamma = gamma)
-            embeddings['z'].append(z.cpu().numpy())
-            embeddings['pre_attention'].append(pre_z.cpu().numpy())
-            embeddings['post_attention'].append(post_z.cpu().numpy())
+            z_intrinsic, z_spatial = self.forward_batch(batch, embedding_only = True)
+            embeddings['z_intrinsic'].append(z_intrinsic.cpu().numpy())
+            embeddings['z_spatial'].append(z_spatial.cpu().numpy())
             cell_indices.append(batch['cell_idx'])
             
         self.embedding = {
-            'z': np.concatenate(embeddings['z'], axis = 0),
-            'pre_attention': np.concatenate(embeddings['pre_attention'], axis = 0),
-            'post_attention': np.concatenate(embeddings['post_attention'], axis = 0),
+            'z_intrinsic': np.concatenate(embeddings['z_intrinsic'], axis = 0),
+            'z_spatial': np.concatenate(embeddings['z_spatial'], axis = 0),
             'cell_idx': np.concatenate(cell_indices, axis = 0)
         }
         
         return self.embedding
     
     @torch.no_grad()
-    def predict(self, alpha = 1.0, gamma = 1.0):
+    def predict(self):
         self.model.eval()
-        x_hat = []
+        mu = []
         pi = []
-        t1 = time.perf_counter()
+        mu_intrinsic = []
+        delta = []
         for batch in self.dataloader:
-            result = self.forward_batch(batch, alpha = alpha, gamma = gamma)
-            x_hat.append(result['mu_x'].cpu().numpy())
-            pi.append(result['pi'].cpu().numpy())
+            output = self.forward_batch(batch)
+            mu.append(output['mu'].cpu().numpy())
+            pi.append(output['pi'].cpu().numpy())
+            mu_intrinsic.append(output['mu_intrinsic'].cpu().numpy())
+            delta.append(output['delta'].cpu().numpy())
             
-        x_hat = np.concatenate(x_hat, axis = 0)
+        mu = np.concatenate(mu, axis = 0)
         pi = np.concatenate(pi, axis = 0)
         theta = torch.exp(self.model.decoder.log_theta).detach().cpu().numpy()
+        mu_intrinsic = np.concatenate(mu_intrinsic, axis = 0)
+        delta = np.concatenate(delta, axis = 0)
         return {
-            'mu': x_hat,
+            'mu': mu,
             'pi': pi,
-            'theta': theta
+            'theta': theta,
+            'mu_intrinsic': mu_intrinsic,
+            'delta': delta
         }
 
     def save(
