@@ -11,7 +11,9 @@ import time
 from collections import defaultdict
 
 class SpatialAutoencoderTrainer:
-    
+    """
+    Class that takes a SpatialNeighbors object, model/training parameters, and runs the training loop
+    """
     def __init__(
         self,
         graph: SpatialNeighbors,
@@ -115,6 +117,7 @@ class SpatialAutoencoderTrainer:
             self.n_batches = len(unique)
             self.graph.adata.obs[f'{self.batch_key}_int'] = labels
         
+        # Setup celltype encoding
         self.n_celltypes = 1
         if self.celltype_key:
             if self.celltype_key not in self.graph.adata.obs:
@@ -123,6 +126,8 @@ class SpatialAutoencoderTrainer:
             self.celltype_labels = labels
             self.n_celltypes = len(unique)
             self.graph.adata.obs[f'{self.celltype_key}_int'] = labels
+        
+        # Optimizer/training parameters
         self.learning_rate = learning_rate
         self.weigh_decay = weight_decay
         self.lr_patience = lr_patience
@@ -134,6 +139,7 @@ class SpatialAutoencoderTrainer:
         self.early_stop_delta = early_stop_delta   
         self.early_stop_offset = early_stop_offset    
         
+        # Annealing parameters
         self.beta_kl_max = beta_kl_max
         self.beta_ramp_start = beta_ramp_start
         self.beta_ramp_end = beta_ramp_end
@@ -175,7 +181,6 @@ class SpatialAutoencoderTrainer:
         self.graph.adata = value
 
     def setup(self, verbose: bool = True):
-
         if verbose:
             print("Setting up spatial datasets and dataloaders")
         self._setup_dataset()
@@ -188,15 +193,20 @@ class SpatialAutoencoderTrainer:
 
         
     def _setup_dataset(self):
+        """
+        Create SpatialDataset from the input SpatialNeighbors object
+        """
         if self.graph is None:
             self._setup_spatial_graph()
-            
+        
+        # Full dataset
         self.dataset = SpatialDataset.from_graph(
             self.graph,
             batch_key = f'{self.batch_key}_int' if self.batch_key else None,
             celltype_key = f'{self.celltype_key}_int' if self.celltype_key else None,
         )
         
+        # Train dataset
         self.train_dataset = SpatialDataset.from_graph(
             self.graph,
             cell_indices = self.graph.split_idx['train_idx'],
@@ -204,6 +214,7 @@ class SpatialAutoencoderTrainer:
             batch_key = f'{self.batch_key}_int' if self.batch_key else None,
         )
         
+        # Validation dataset
         self.val_dataset = SpatialDataset.from_graph(
             self.graph,
             cell_indices = self.graph.split_idx['val_idx'],
@@ -211,6 +222,7 @@ class SpatialAutoencoderTrainer:
             batch_key = f'{self.batch_key}_int' if self.batch_key else None,
         )
         
+        # Test dataset
         self.test_dataset = SpatialDataset.from_graph(
             self.graph,
             cell_indices = self.graph.split_idx['test_idx'],
@@ -218,6 +230,7 @@ class SpatialAutoencoderTrainer:
             batch_key = f'{self.batch_key}_int' if self.batch_key else None,
         )
         
+        # Convert count matrix to tensor
         self.X = self.adata.X if self.layer is None else self.adata.layers[self.layer]
         if issparse(self.X):
             self.X = self.X.toarray()
@@ -225,9 +238,13 @@ class SpatialAutoencoderTrainer:
             
         
     def _setup_dataloaders(self):
+        """
+        Make dataloader objects for full dataset and train/test/val datasets
+        """
         if self.dataset is None:
             self._setup_dataset()
 
+        # Randomly sample central cells by batch for training dataloader
         def make_stratified_sampler(idxs):
             counts = np.bincount(self.labels[idxs])
             weights = 1.0 / counts[self.labels[idxs]]
@@ -273,6 +290,9 @@ class SpatialAutoencoderTrainer:
         )
         
     def _setup_model(self):
+        """
+        Setup the model architecture
+        """
         if self.graph is None:
             self._setup_spatial_graph()
         
@@ -297,6 +317,9 @@ class SpatialAutoencoderTrainer:
         
         
     def _setup_optimizer(self):
+        """
+        Setup optimizer, scheduler, and early stopping
+        """
         if self.model is None:
             self._setup_model()
             
@@ -318,12 +341,13 @@ class SpatialAutoencoderTrainer:
         self.early_stopping = EarlyStopping(patience = self.early_stop_patience, delta = self.early_stop_delta)
         
     def _setup_loss(self):
-
         self.loss = ReconstructionLoss().to(self.device)
         
         
     def forward_batch(self, batch, alpha = 1.0, embedding_only = False, verbose = False):
-            
+        """
+        Efficient method for the forward pass of a single batch
+        """
         cell_idx = batch['cell_idx']
         celltype_labels = batch['celltype_label'].to(self.device)
         neighbor_idx = batch['neighbor_idx']
@@ -361,9 +385,11 @@ class SpatialAutoencoderTrainer:
         )
         neighbor_z[neighbor_mask] = unique_mu_z[neighbor_inverse].detach()
         
+        # Get neighbor mask
         has_neighbors = neighbor_mask.any(dim = -1)
         z_spatial = torch.zeros((z_intrinsic.shape[0], self.attn_dim), dtype = torch.float32, device = z_intrinsic.device)
         
+        # Forward pass through the attention block
         weights = None
         if has_neighbors.any():
             query = z_intrinsic.detach()
@@ -378,6 +404,7 @@ class SpatialAutoencoderTrainer:
         if embedding_only:
             return z_intrinsic, z_spatial
 
+        # Forward pass through decoder
         mu, theta, pi, mu_intrinsic, delta = self.model.decode(z_intrinsic, z_spatial, log_library_size, batch_label, alpha)
         
         return {
@@ -395,6 +422,9 @@ class SpatialAutoencoderTrainer:
         }
         
     def _calc_loss_from_outputs(self, outputs, beta_kl = 1.0, gamma = 1.0, lambda_mu_prior = 1e-3, lambda_delta = 1e-3):
+        """
+        Wrapper function to take model outputs + coefficients and calculate the loss
+        """
         loss = self.loss(
             outputs['mu_z_prior'],
             outputs['mu_z'],
@@ -414,7 +444,9 @@ class SpatialAutoencoderTrainer:
         return loss
         
     def train(self, random_state: int = 42, verbose: bool = True):
-        
+        """
+        Train the model
+        """
         set_random_seed(random_state, self.device)
         history = []
         for epoch in (pbar := tqdm(range(self.max_epochs), desc = 'Training model', disable = not verbose)):
@@ -477,6 +509,7 @@ class SpatialAutoencoderTrainer:
                 for l in val_loss:
                     val_loss[l] /= n_val
                 
+            # Check annealing parameters before updating lr_scheduler and early_stopping
             if epoch > self.beta_ramp_start:
                 self.scheduler.step(val_loss['loss'])
             if epoch > max(self.beta_ramp_end, self.gamma_ramp_end, self.alpha_ramp_end) + self.early_stop_offset:
@@ -573,6 +606,9 @@ class SpatialAutoencoderTrainer:
     
     @torch.no_grad()
     def eval_test(self):
+        """
+        Calculate loss on test dataset
+        """
         n_test = 0
         test_loss = 0.0
         self.model.eval()
@@ -596,6 +632,9 @@ class SpatialAutoencoderTrainer:
     
     @torch.no_grad()
     def get_embedding(self, alpha = 1.0, gamma = 1.0):
+        """
+        Get the full embedding matrix for the intrinsic embedding and spatial context
+        """
         self.model.eval()
         embeddings = {'z_intrinsic': [], 'z_spatial': []}
         cell_indices = []

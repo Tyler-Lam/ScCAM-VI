@@ -9,6 +9,28 @@ import numpy as np
 from typing import Literal
 
 class RBFDistanceEncoder(nn.Module):
+    """
+    Class to encode distances as attention biases using RBF weights. The weight given to a distance is it's sum over the RBF bases
+    
+    A cell with distance d from the central cell will have an RBF weight for radius r_i given by:
+    
+    w_i = exp(-(r_i-d)^2 / (2 * sigma_i^2)), where sigma_i is r_{i+1} - r_i
+    
+    The net weight will then be given by
+    w = Sum_i(w_i)
+    where i goes from 1 to n_basis
+
+    Parameters:
+    -----------
+    n_basis: int = 16
+        Number of bases for RBF distances
+    d_min: float = 0
+        Minimum distance for RBF encoding
+    d_max: float = 0
+        Maximum distance for RBF encoding
+    spacing: Literal['log', 'linear'] = 'linear',
+        Spacing option for rbf bases. linear uses evenly spaced radii, log uses log base 10
+    """
     def __init__(
         self,
         n_basis: int = 16,
@@ -65,7 +87,31 @@ class RBFDistanceEncoder(nn.Module):
     
     
 class SpatialCrossAttention(nn.Module):
+    """
+    Model which takes the central cell embedding, neighbor cell embeddings, neighbor cell distances, and returns an embedding representing the spatial context
     
+    Parameters:
+    -----------
+    latent_dim: int
+        Number of latent dimensions for cell embeddings
+    attn_dim: Optional[int] = None
+        Dimension for attention embedding. The number of attention heads must be a divisor of the input embedding dimension.
+        This parameters allows attention model to project latent dimension into different dimensional embeddings. For example,
+        if there are 10 latent dimensions but we want 3 attention heads, we can set attn_dim = 9, 12, 15, etc
+    num_heads: int = 1
+        Number of attention heads
+    dropout: float = 0.1
+        Percent dropout for training
+    d_min, d_max, rbf_n_basis, rbf_spacing
+        Parameters for the RBFDistanceEncoder class
+    need_weights: bool = False
+        Return weights for each attention head. If False, return only the attention context. Per pytorch, this should run faster if set to False.
+        UPDATE: This currently doesn't do anything, the model will always return the weights as well
+    project_inputs: bool = True
+        Use a linear layer to project input embeddings before passing through the attention model. If attn_dim != latent_dim this must be set to True
+    topk: int = -1
+        Use only the top k neighbors by attention weight. If >-1, do a no_grad forward pass through the attention block to get the weights. Then sort and select the top K, mask the others, and do the real forward pass.
+    """
     def __init__(
         self,
         latent_dim: int,
@@ -139,6 +185,7 @@ class SpatialCrossAttention(nn.Module):
             key = neighbor_z
             value = neighbor_z
 
+        # All of the flattening/reshaping was done by claude. It works but I'm pretty sure a lot of it is unnecessary
         padding_mask = torch.zeros(
             neighbor_mask.shape[0], 1, neighbor_mask.shape[1], dtype = torch.float32, device = central_z.device
         )
@@ -181,7 +228,7 @@ class SpatialCrossAttention(nn.Module):
             key = key,
             value = value,
             attn_mask = attn_bias,
-            need_weights = False,
+            need_weights = True,
             average_attn_weights = False
         )
         

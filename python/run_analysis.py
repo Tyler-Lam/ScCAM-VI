@@ -20,17 +20,19 @@ if not os.path.isdir(dst_dir):
 
 adata = sc.read_h5ad('/common/lamt2/attention/data/anndata/adata_merged_qc.h5ad')
 
+# Make the spatial neighbors object
 neighbors = SpatialNeighbors(
     adata,
     unique_core_key='sample',
     neighbor_method = 'radius',
     radius = 200,
 )
-
+# Calculate neighbors
 neighbors.build_neighbors()
-
+# Split data
 split_idx = neighbors.split_data(bin_length = 700, verbose = True)
 
+# Create the trainer
 trainer = SpatialAutoencoderTrainer(
     graph = neighbors,
     batch_key = 'sample',
@@ -62,14 +64,23 @@ trainer = SpatialAutoencoderTrainer(
     num_workers = 0,
 )
 
+# Setup the model
 trainer.setup()
 
+# Run the training loop
 trainer.train()
+
+# Save the model
 trainer.save(dst_dir)
+
+# Saving other stuff
+
+# Loss history plot
 fig = trainer.plot_history(show = False)
 plt.savefig(f'{dst_dir}/loss.png', bbox_inches = 'tight')
 plt.close()
 
+# RBF distance weights
 centers, widths, weights = trainer.model.attention.distance_encoding.get_distance_curve()
 plt.scatter(centers, weights)
 plt.xlabel('Distance [um]')
@@ -77,10 +88,12 @@ plt.ylabel('Attention bias')
 plt.savefig(f'{dst_dir}/rbf_distances.png')
 plt.close()
 
+# Save embeddings
 embs = trainer.get_embedding()
 np.save(f'{dst_dir}/X_intrinsic.npy', embs['z_intrinsic'])
 np.save(f'{dst_dir}/X_spatial.npy', embs['z_spatial'])
 
+# Violin plot of embeddings (intrinsic and spatial context)
 fig, ax = plt.subplots(2, 1, figsize = (6.4, 4.8 * 2), constrained_layout = True)
 sns.violinplot(embs['z_intrinsic'], ax = ax[0], inner = 'quart')
 ax[0].set_title("Z_intrinsic")
@@ -89,6 +102,7 @@ ax[1].set_title("Z_spatial")
 plt.savefig(f'{dst_dir}/violins.png')
 plt.close()
 
+# Get LFC from spatial context from model for each gene per cell
 predictions = trainer.predict()
 deltas = predictions['delta'].flatten()
 dmin = np.quantile(deltas, .01)
@@ -100,6 +114,7 @@ plt.ylabel("Counts")
 plt.savefig(f'{dst_dir}/lfcs.png')
 plt.close()
 
+# Do clustering on the intrinsic embedding
 trainer.adata.obsm['X_vae'] = embs['z_intrinsic']
 print("Building neighborhood graph ... ", end = '')
 t0 = time.perf_counter()
@@ -125,6 +140,7 @@ for r in tqdm([0.3, 0.5, 1.0], desc = 'Leiden clustering'):
         key_added = f'leiden_{str(r).replace(".", "p")}'
     )
 
+# Cluster the spatial embedding to calculate niches
 t0 = time.perf_counter()
 trainer.adata.obsm['X_niche'] = embs['z_spatial']
 print("Clustering niches ... ", end = '')

@@ -4,6 +4,9 @@ import torch.nn.functional as F
 from typing import Optional, Literal
 
 class ReconstructionLoss(nn.Module):
+    """
+    Module to calculate the loss terms for the VAE
+    """
     def __init__(self):
         super().__init__()
                 
@@ -13,6 +16,9 @@ class ReconstructionLoss(nn.Module):
         log_var: torch.Tensor,
         mu_prior: torch.Tensor,
     ):
+        """
+        KL Divergence from the encoder. Each latent variable has a mean and variance, which is subject to a gaussian prior with cell specific mean and unit variance
+        """
         kl = 0.5 * (
             log_var.exp() + (mu - mu_prior).pow(2) - 1 - log_var
         ).sum(dim = -1)
@@ -26,6 +32,20 @@ class ReconstructionLoss(nn.Module):
         pi: torch.Tensor,
         eps: float = 1e-8,
     ):
+        """
+        Zero-inflated negative binomial negative log-likelihood
+        
+        Parameters:
+        -----------
+        X: torch.Tensor
+            Observed counts
+        mu: torch.Tensor
+            Predicted mean
+        theta: torch.Tensor
+            Predicted overdispersion
+        pi: torch.Tensor
+            Predicted zero inflation probability
+        """
         theta = theta.unsqueeze(0)
         pi = pi.unsqueeze(0)
         mu = mu.clamp_min(eps)

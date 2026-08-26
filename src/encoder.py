@@ -3,7 +3,24 @@ import torch.nn as nn
 from typing import List, Optional, Literal
 
 class MLPEncoder(nn.Module):
+    """
+    Module that passes raw count data through an MLP encoder to produce the mean and log_var of each latent dimension
     
+    Parameters:
+    -----------
+    n_genes: int
+        Input number of genes
+    latent_dim: int
+        Number of latent dimensions
+    hidden_dims: List[int] = []
+        Dimensions for each hidden layer
+    dropout: float = 0.1
+        Percent dropout for training
+    activation: Literal['gelu', 'relu', 'leaky_relu'] = 'gelu'
+        Activation function
+    use_layer_norm: bool = True
+        Use layer norm after each layer
+    """
     def __init__(
         self,
         n_genes: int,

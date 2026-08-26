@@ -10,6 +10,22 @@ from typing import Optional, Literal, Sequence
 import warnings
 
 class SpatialDataset(Dataset):
+    """
+    Dataset class to handle fetching a central cell and neighboring cells gene expression + distances
+    
+    Parameters:
+    -----------
+    X: csr_matrix | np.ndarray
+        Full input gene expression matrix
+    distances: csr_matrix
+        Sparse distance matrix that contains distances for neighboring cells
+    celltype_labels: Optional[np.ndarray] = None
+        Optional array containing integer encoded celltype labels
+    cell_indices: Optional[np.ndarray] = None
+        Optional array containing indices of cells to use as 'central' cells. If not provided, consider all cells as potential central cells
+    batch_labels: Optional[np.ndarray] = None
+        Optional array containing integer encoded batch labels
+    """
     def __init__(
         self,
         X: csr_matrix | np.ndarray,
@@ -51,6 +67,9 @@ class SpatialDataset(Dataset):
         celltype_key: Optional[str] = None,
         batch_key: Optional[str] = None,
     ):
+        """
+        Class method to create a dataset from a SpatialNeighbors object
+        """ 
         X = graph.adata.X
         return SpatialDataset(
             X = X,
@@ -102,7 +121,6 @@ class SpatialDataset(Dataset):
         starts = self.distances.indptr[cell_idx]
         ends = self.distances.indptr[cell_idx + 1]
         max_neighbors = (ends - starts).max()
-        #max_neighbors = np.diff(self.distances[cell_idx].indptr).max()
 
         neighbor_dists = np.zeros((len(idxs), max_neighbors), dtype = np.float32)
         neighbor_mask = np.zeros((len(idxs), max_neighbors), dtype = bool)

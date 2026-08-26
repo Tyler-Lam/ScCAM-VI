@@ -11,6 +11,16 @@ from decoder import *
 from loss import *
 
 class CellTypePrior(nn.Module):
+    """
+    Class to learn the celltype prior means for the latent embeddings
+    
+    Parameters:
+    -----------
+    n_celltypes: int
+        Number of unique celltypes
+    latent_dim: int
+        Number of latent dimensions
+    """
     def __init__(self, n_celltypes: int, latent_dim: int):
         super().__init__()
         self.prior_mu = nn.Embedding(n_celltypes, latent_dim)
@@ -20,6 +30,44 @@ class CellTypePrior(nn.Module):
         return self.prior_mu(celltype_idx)
     
 class SpatialAutoEncoder(nn.Module):
+    """
+    Module to contain the intrinsic encoder, spatial attention, and intrinsic/spatial decoder
+    
+    Parameters:
+    -----------
+    n_genes: int
+        Number of genes for input dimension
+    latent_dim: int
+        Number of latent dimensions
+    n_celltypes: int = 1
+        Number of unique celltypes for celltype prior means
+    hidden_dims: Llist[int] = []
+        Hidden dimensions for encoder, which are mirrored in the decoder
+    attn_dim: Optional[int] = None
+        If provided, project embeddings to the attn_dim before passing through attention block
+    topk: int = -1
+        Use the top K neighboring cells by weight
+    project_inputs: bool = True
+        Project embeddings using a linear layer before passing through the attention block
+    num_heads: int = 1
+        Number of attention heads
+    dropout: float = 0.1
+        Dropout percent for training
+    n_batches: int = 1
+        Number of unique batch keys for batch correction
+    batch_dim: int = 8
+        Number of dimensions for batch correction embedding
+    d_min: float = 0
+        Minimum distance for RBF encoding
+    d_max: float = 1
+        Maximum distance for RBF encoding
+    rbf_n_basis: int = 16
+        Number of bases for RBF distance encoding
+    rbf_spacing: Literal['linear', 'log'] = 'log'
+        Spacing for RBF bases
+    activation: Literal['gelu', 'relu', 'leaky_reul'] = 'gelu'
+        Activation function
+    """
     def __init__(
         self,
         n_genes: int,
@@ -101,21 +149,29 @@ class SpatialAutoEncoder(nn.Module):
         self.mu = nn.Linear(self.latent_dim, self.latent_dim)
         self.log_var = nn.Linear(self.latent_dim, self.latent_dim)
         
-        # Vector gate for attention model
+        # Vector gate for attention model (tested, no long using?)
         self.gamma = nn.Parameter(torch.zeros(self.latent_dim))
         
+
     def reparameterize(
         self,
         mu: torch.Tensor,
         log_var: torch.Tensor
     ):
+        """
+        Function to sample a latent embedding given the mean and variance
+        """
         if self.training:
             std = torch.exp(0.5 * log_var)
             eps = torch.randn_like(std)
             return mu + eps * std
         else:
             return mu
-
+        
+    # The functions below here are not actually used, they represent a single forward pass given a central cell and it's neighbors as separate arguments
+    # This becomes very inefficient for batch training, as a single input gene expression has to undergo several forward passes (as a neighbor for multiple cells and as its own central cell)
+    # The trainer has a forward batch pass that is substantially more efficient
+    
     def encode(
         self,
         central_X: torch.Tensor,
@@ -194,6 +250,9 @@ class SpatialAutoEncoder(nn.Module):
         dst_dir: str = '',
         savenm: str = ''
     ):
+        """
+        This method has not been updated in a while and is missing a lot of input parameters
+        """
         cfg = ModelConfig(
             n_genes = self.n_genes,
             latent_dim = self.latent_dim,

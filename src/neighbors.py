@@ -87,6 +87,26 @@ def flag_buffer_cells(
             
 
 class SpatialNeighbors:
+    """
+    Class that takes an anndata and calculates the spatial neighbors + bins data into train/test/val dataset
+    
+    Parameters:
+    -----------
+    adata: ad.AnnData
+        Input anndata
+    unique_core_key: str = 'core_id'
+        Key in anndata that denotes separate cores. Equivalent of 'library_key' in squidpy
+    neighbor_method: Literal['radiu', 'precomputed'] = 'radius'
+        Method to use when calculating neighbors. If using precomputed, the neighbor_key and distance_key must be present in adata.obsp
+    neighbor_key: str = 'spatial_connectivities'
+        Key for connectivity matrix in adata.obsp
+    distance_key: str = 'spatial_distances'
+        Key for distance matrix in adata.obsp
+    radius: float = 100
+        Radius for neighbor connectivity calculation
+    max_neighbors: Optional[int] = None
+        Optional max number of neighbors. If given, taken the N closest neighbors
+    """
     def __init__(
         self,
         adata: ad.AnnData,
@@ -144,7 +164,6 @@ class SpatialNeighbors:
         
         for i, (row_dist, row_idx) in enumerate(zip(dists, indices)):
             mask = (row_idx != i)
-            #n = min(len(row_idx) - 1, self.max_neighbors)
             self.neighbors[global_idx[i]] = global_idx[row_idx[mask]][:self.max_neighbors]
             self.distances[global_idx[i]] = row_dist[mask][:self.max_neighbors]
             
@@ -158,6 +177,14 @@ class SpatialNeighbors:
         bin_length: float,
         verbose: bool = False,
     ):
+        """
+        Calculate hexagonal grid and bin cells
+        
+        Parameters:
+        -----------
+        bin_length: float
+            Length of hexagonal bins. Since this was vibe coded idk if this is the side length, corner - center length, or something else
+        """
         
         bin_labels = np.full(len(self.adata), -1, dtype = np.int32)
         
@@ -185,6 +212,24 @@ class SpatialNeighbors:
         random_state: float = 42,
         verbose: bool = False
     ):
+        """
+        Split data into train/test/validation sets
+        
+        Parameters:
+        -----------
+        method: Literal['grid', 'core'] = 'grid'
+            Method for splitting data. If grid, randomly assign hexagonal bins to train/test/validation, then flag buffer cells. If 'core', assign individual cores, optionally stratified by the 'stratify_by' argument
+        bin_length: float = 200
+            Bin length if using grid splitting
+        buffer_cells: bool = True
+            Flag buffer cells (cells with neighboring cells assigned to a different category)
+        test_size: float = 0.15
+            Fraction of total data to use for test set
+        val_size: float = 0.15
+            Fraction of total data for validation set
+        stratify_by: Optional[str] = None
+            If splitting by core, use stratified random sampling using self.adata.obs[stratify_by]
+        """
         if method == 'grid':
             split_idx = self.split_by_grid(
                 bin_length = bin_length,
@@ -318,9 +363,13 @@ class SpatialNeighbors:
         self,
         cell_indices: np.ndarray
     ):
-        
+        """
+        Function to slice the anndata by index while preserving all neighbor matrices. The indices of the sliced SpatialNeighbor object will be mapped to the local index in the sliced object
+        """
+        # Get all cell indices needed for the sliced spatialneighbors object (cell_indicies + neighbors)
         all_indices = set(self.adata.obsp[self.neighbor_key][cell_indices].indices)
         all_indices = sorted(all_indices)
+        # Map the current global index to the sliced local index
         global_to_local = np.full(self.n_cells, -1, dtype = np.int64)
         global_to_local[all_indices] = np.arange(len(all_indices))
         global_to_local = np.concatenate([global_to_local, [-1]])
@@ -335,7 +384,9 @@ class SpatialNeighbors:
         sliced.distance_key = self.distance_key
         sliced.radius = self.radius
         
+        # Slice the anndata + neighbor matrices and map indices to local
         sliced.adata = self.adata[all_indices].copy()
         sliced.adata.obsp[self.distance_key].indices = global_to_local[sliced.adata.obsp[self.distance_key].indices]
         sliced.adata.obsp[self.neighbor_key].indices = global_to_local[sliced.adata.obsp[self.neighbor_key].indices]
+        # Return sliced indices and the map
         return sliced, global_to_local[cell_indices]
