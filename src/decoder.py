@@ -85,7 +85,6 @@ class MLPDecoder(nn.Module):
         lib_size = torch.exp(log_library_size).unsqueeze(-1)
         mu_base = lib_size * rho
         mu = mu_base * torch.exp(alpha * lfc)
-        mu = lib_size * rho
         pi = F.sigmoid(self.pi)
         theta = torch.exp(self.log_theta)
         return mu, theta, pi, mu_base, lfc

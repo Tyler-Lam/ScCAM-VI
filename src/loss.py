@@ -66,17 +66,22 @@ class ReconstructionLoss(nn.Module):
     ):
         # KL Divergence on latent space
         loss_kl = self.kl_divergence(z, log_var, mu_z_prior)
+        
         # L1 regularization on latent means priors
         loss_prior_reg = mu_z_prior.abs().mean()
+        
         # zinb nll loss
         loss_recon = self.zinb_nll(x, mu, theta, pi)
+        
         # zinb nll loss on intrinsic predictions
         loss_recon_intrinsic = self.zinb_nll(x, mu_intrinsic, theta, pi)
+        
         # L1 regularization on log fold changes
         loss_delta_reg = delta.abs().sum(dim = -1).mean()
         
         # Total loss
         loss = loss_recon.sum(dim = -1).mean() + gamma * loss_recon_intrinsic.sum(dim = -1).mean() + beta_kl * loss_kl + loss_kl.mean() + lambda_mu_prior * loss_prior_reg + lambda_delta * loss_delta_reg
+        
         return {
             'loss': loss,
             'loss_recon': loss_recon.sum(dim = -1).mean().item(),

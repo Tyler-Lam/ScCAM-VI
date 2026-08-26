@@ -27,6 +27,7 @@ class SpatialAutoEncoder(nn.Module):
         n_celltypes: int = 1,
         hidden_dims: List[int] = [],
         attn_dim: Optional[int] = None,
+        topk: int = -1,
         project_inputs: bool = True,
         num_heads: int = 1,
         dropout: float = 0.1,
@@ -44,6 +45,7 @@ class SpatialAutoEncoder(nn.Module):
         self.latent_dim = latent_dim
         self.hidden_dims = hidden_dims
         self.attn_dim = attn_dim
+        self.topk = topk
         self.project_inputs = project_inputs
         self.n_celltypes = n_celltypes
         self.n_batches = n_batches
@@ -81,7 +83,8 @@ class SpatialAutoEncoder(nn.Module):
             d_min = self.d_min,
             d_max = self.d_max,
             rbf_n_basis = self.rbf_n_basis,
-            rbf_spacing = self.rbf_spacing
+            rbf_spacing = self.rbf_spacing,
+            topk = self.topk
         )
         
         self.decoder = MLPDecoder(

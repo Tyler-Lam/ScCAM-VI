@@ -15,7 +15,6 @@ class RBFDistanceEncoder(nn.Module):
         d_min: float = 0,
         d_max: float = 1,
         spacing: Literal['log', 'linear'] = 'linear',
-        trainable: bool = True,
     ):
         super().__init__()
         
@@ -23,7 +22,6 @@ class RBFDistanceEncoder(nn.Module):
         self.d_min = d_min
         self.d_max = d_max
         self.spacing = spacing
-        self.trainable = trainable
 
         if spacing == 'log':
             centers = torch.logspace(
@@ -48,28 +46,21 @@ class RBFDistanceEncoder(nn.Module):
         self.register_buffer('centers', centers)
         self.register_buffer('widths', widths)
         
-        if self.trainable:
-            self.weights = nn.Parameter(torch.ones(n_basis) / n_basis)
+        self.weights = nn.Parameter(torch.ones(n_basis) / n_basis)
             
     def forward(self, distances: torch.Tensor):
         d = distances.unsqueeze(-1)
         activations = torch.exp(
             -((d - self.centers) ** 2) / (2 * self.widths ** 2 + 1e-8)
         )
-
-        if self.trainable:
-            bias = activations @ self.weights
-        else:
-            bias = activations.sum(dim = -1)
+        bias = activations @ self.weights
         return bias
     
     def get_distance_curve(self):
         centers = self.centers.detach().cpu().numpy()
         widths = self.widths.detach().cpu().numpy()
-        weights = np.ones(len(centers))
-        if self.trainable:   
-            weights = self.weights.detach().cpu().numpy()
-            
+        weights = self.weights.detach().cpu().numpy()
+
         return centers, widths, weights
     
     
@@ -86,7 +77,8 @@ class SpatialCrossAttention(nn.Module):
         rbf_n_basis: int = 16,
         rbf_spacing: Literal['log', 'linear'] = 'log',
         need_weights: bool = True,
-        project_inputs: bool = True
+        project_inputs: bool = True,
+        topk: int = -1,
     ):
         super().__init__()
         
@@ -105,6 +97,7 @@ class SpatialCrossAttention(nn.Module):
         self.rbf_spacing = rbf_spacing
         self.need_weights = need_weights
         self.project_inputs = project_inputs
+        self.topk = topk
         
         self.query_proj = None
         self.key_proj = None
@@ -126,7 +119,6 @@ class SpatialCrossAttention(nn.Module):
             d_min = self.d_min,
             d_max = self.d_max,
             spacing = self.rbf_spacing,
-            trainable = True
         )
         
         self.layer_norm = nn.LayerNorm(self.attn_dim)
@@ -155,9 +147,35 @@ class SpatialCrossAttention(nn.Module):
         )
         attn_bias = padding_mask + self.distance_encoding(distances).unsqueeze(1)
         attn_bias = attn_bias.expand(-1, self.num_heads, -1)
+        
+        attn_bias_flat = attn_bias.reshape(
+            attn_bias.shape[0] * self.num_heads, 1, attn_bias.shape[-1]
+        )
+        
+        if self.topk != -1:
+            B, L, D = query.shape
+            S = key.shape[1]
+            with torch.no_grad():
+                _, attn_weights = self.attention(
+                    query = query,
+                    key = key,
+                    value = value,
+                    attn_mask = attn_bias_flat,
+                    need_weights = True,
+                    average_attn_weights = False
+                )
+
+                topk_idx = attn_weights.topk(self.topk, dim = -1).indices
+                keep = torch.zeros_like(attn_weights, dtype = torch.bool)
+                keep.scatter_(-1, topk_idx, True)
+                block_mask = (~keep).squeeze(2)
+                
+            attn_bias = attn_bias.masked_fill(block_mask, float('-inf'))
+            
         attn_bias = attn_bias.reshape(
             attn_bias.shape[0] * self.num_heads, 1, attn_bias.shape[-1]
         )
+        
         context, attn_weights = self.attention(
             query = query,
             key = key,

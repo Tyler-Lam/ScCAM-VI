@@ -29,6 +29,7 @@ class SpatialAutoencoderTrainer:
         latent_dim: int = 10,
         hidden_dims: List[int] = [],
         attn_dim: Optional[int] = None,
+        topk: int = 20,
         project_inputs: bool = True,
         num_heads: int = 1,
         dropout: float = 0.1,
@@ -87,6 +88,7 @@ class SpatialAutoencoderTrainer:
         self.latent_dim = latent_dim
         self.hidden_dims = hidden_dims
         self.attn_dim = attn_dim if attn_dim is not None else latent_dim
+        self.topk = topk
         self.project_inputs = project_inputs
         self.num_heads = num_heads
         self.dropout = dropout
@@ -279,6 +281,7 @@ class SpatialAutoencoderTrainer:
             latent_dim = self.latent_dim,
             hidden_dims = self.hidden_dims,
             attn_dim = self.attn_dim,
+            topk = self.topk,
             project_inputs = self.project_inputs,
             num_heads = self.num_heads,
             dropout = self.dropout,
@@ -637,7 +640,7 @@ class SpatialAutoencoderTrainer:
             'mu_intrinsic': mu_intrinsic,
             'delta': delta
         }
-
+        
     def save(
         self,
         dst_dir: str = '',
