@@ -23,7 +23,7 @@ $$
 p(\mathbf{z}\_i\mid k) = \mathcal{N}(\mathbf{m}\_{i,k}, 1)
 $$
 
-with a prior learned mean $\mathbf{m}\_{i,k}$, where $z\in[1,n\_\text{latent}]$. The intrinsic embedding is resampled from the posterior distribution with a learned mean $\mu_\text{int,i}$ and variance $\sigma_i$. A decoder then takes this intrinsic embedding and outputs the estimated mean of the ZINB distribution $\hat{\mu}_{g,\mathrm{int}}$
+with a prior learned mean $\mathbf{m}\_{i,k}$, where $i\in[1,n\_\text{latent}]$. The intrinsic embedding is resampled from the posterior distribution with a learned mean $\mu_\text{int,i}$ and variance $\sigma_i$. A decoder then takes this intrinsic embedding and outputs the estimated mean of the ZINB distribution $\hat{\mu}_{g,\mathrm{int}}$
 
 ### Residual Spatial Attention Block
 The aggregated neighboring cells are passed through the spatially invariant encoder to obtain the latent representation. For N neighboring cells, we obtain the neighbor latent embeddings and distances to the central cell
